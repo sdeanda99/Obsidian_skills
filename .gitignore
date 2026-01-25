@@ -1,0 +1,33 @@
+# Environment
+.env
+
+# Node
+node_modules/
+.opencode/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/

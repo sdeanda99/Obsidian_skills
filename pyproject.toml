@@ -1,0 +1,20 @@
+[project]
+name = "obsidian-skills"
+version = "1.0.0"
+description = "OpenCode skills and tools for Obsidian integration"
+authors = [{name = "Sebastian De Anda"}]
+license = {text = "Apache-2.0"}
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/sdeanda99/Obsidian_skills"
+Repository = "https://github.com/sdeanda99/Obsidian_skills"
+Issues = "https://github.com/sdeanda99/Obsidian_skills/issues"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

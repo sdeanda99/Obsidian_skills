@@ -1,0 +1,5 @@
+# Python dependencies for Obsidian Skills
+# Install with: pip install -r requirements.txt
+# Or use uv: uv pip install -e .
+
+PyYAML>=6.0
