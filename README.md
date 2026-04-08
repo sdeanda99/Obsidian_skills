@@ -1,32 +1,33 @@
 # Obsidian Skills for OpenCode
 
-OpenCode skills and tools for seamless Obsidian integration. This repository provides AI agents with the ability to interact with your Obsidian vault through the REST API and search capabilities.
+OpenCode skills and tools for seamless Obsidian integration. This repository provides AI
+agents with the ability to interact with your Obsidian vault through the native CLI and
+search capabilities.
 
 ## Features
 
-- **Obsidian REST API Skill** - Full CRUD operations for notes with metadata management
-- **Omnisearch Custom Tool** - Fast, fuzzy vault search with result excerpts
-- **Comprehensive Documentation** - API references, authentication guides, and practical examples
-- **MCP Integration Research** - Notes on Model Context Protocol server integration
+- **Obsidian CLI Skill** — General-purpose vault management via the native Obsidian CLI
+- **Obsidian Dev Notes Skill** — Structured developer knowledge with MOCs, decisions, patterns
+- **Omnisearch Custom Tool** — Fast, fuzzy vault search with result excerpts
+- **Obsidian CLI Tool** — Typed TypeScript wrapper for vault CRUD, properties, tasks, and links
 
 ## Prerequisites
 
 ### Required Software
 
-- **Obsidian** (latest version recommended)
-- **Node.js** 16+ (for TypeScript tools)
-- **Python** 3.10+ (for any Python-based utilities)
+- **Obsidian** (desktop app, installer version **1.12.7 or later**)
+- **Bun** (for running TypeScript tools)
+- **Python** 3.10+ (for package install)
 
-### Required Obsidian Plugins
+### Required Setup
 
-1. **Local REST API** - For REST API skill functionality
-   - Install from Community Plugins
-   - Enable the plugin
-   - Copy your API key from plugin settings
+1. **Obsidian CLI** — Enable in Obsidian: Settings → General → Command line interface → toggle on.
+   Restart your terminal after registration. Verify with `obsidian version`.
 
-2. **Omnisearch** - For search tool functionality
-   - Install from Community Plugins
-   - Enable HTTP Server in Omnisearch settings (runs on port 51361)
+2. **Omnisearch plugin** — Install from Community Plugins. Enable HTTP Server in Omnisearch
+   settings (runs on port 51361).
+
+See `obsidian-cli/references/setup.md` for platform-specific CLI setup (Linux, macOS, Windows).
 
 ## Installation
 
@@ -39,7 +40,7 @@ cd Obsidian_skills
 
 ### 2. Install Python Dependencies
 
-**Option A: Using `uv` (recommended - faster)**
+**Option A: Using `uv` (recommended)**
 
 ```bash
 uv pip install -e .
@@ -51,51 +52,44 @@ uv pip install -e .
 pip install -r requirements.txt
 ```
 
-### 3. Configure API Authentication
+### 3. Deploy Skills and Tools
 
-Copy the example environment file:
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` and add your Obsidian REST API key:
+Copy skills and tools to your OpenCode configuration:
 
 ```bash
-obsidian_api_keys=YOUR_API_KEY_HERE
-```
+# Skills
+cp -r obsidian-cli ~/.claude/skills/
+cp -r obsidian-dev-notes ~/.claude/skills/
 
-To find your API key:
-1. Open Obsidian
-2. Go to Settings → Community Plugins → Local REST API
-3. Copy the API key shown
-
-### 4. Deploy Skills and Tools
-
-**For OpenCode Users:**
-
-Copy the skill and tools to your OpenCode configuration:
-
-```bash
-# Copy the REST API skill
-cp -r obsidian-rest-api ~/.claude/skills/
-
-# Copy the Omnisearch tool
+# Tools
 cp tools/omnisearch.ts ~/.claude/tools/
+cp tools/obsidian.ts ~/.claude/tools/
 ```
 
-Restart OpenCode to load the new skill and tool.
+Restart OpenCode to load the new skills and tools.
 
 ## Quick Start
 
-### Using the REST API Skill
+### Using the Obsidian CLI Skill
 
-The skill automatically loads when you mention Obsidian operations:
+The skill loads when you mention vault operations:
 
 ```
 "Create a new note called 'Meeting Notes' with today's date"
-"Update the frontmatter in my Daily Note"
-"Read the content of 'Project Ideas.md'"
+"Update the status property on my Project MOC"
+"List all tasks in my Projects folder"
+"Find orphaned notes in my vault"
+```
+
+### Using the Dev Notes Skill
+
+Structured knowledge management triggers:
+
+```
+"Start a new project hub for my authentication refactor"
+"Document the decision to use JWT tokens"
+"Capture the retry pattern I just implemented"
+"Run my weekly review"
 ```
 
 ### Using the Omnisearch Tool
@@ -107,123 +101,115 @@ Search your vault for specific content:
 "Find all notes mentioning 'project deadline'"
 ```
 
-### Manual API Testing
-
-Test the REST API connection:
+Test the Omnisearch endpoint directly:
 
 ```bash
-# Load API key
-export $(cat .env | xargs)
-
-# Test connection
-curl -H "Authorization: Bearer ${obsidian_api_keys}" http://localhost:27123/
-
-# Create a note
-curl -X PUT \
-  -H "Authorization: Bearer ${obsidian_api_keys}" \
-  -H "Content-Type: text/markdown" \
-  -d "# My First Note\n\nCreated via API!" \
-  "http://localhost:27123/vault/My%20First%20Note.md"
+curl "http://localhost:51361/search?q=test"
 ```
 
 ## Available Tools & Skills
 
-### 1. Obsidian REST API Skill
+### 1. Obsidian CLI Skill
 
-**Location:** `obsidian-rest-api/`
+**Location:** `obsidian-cli/`
 
 **Capabilities:**
-- Create notes with optional front-matter
-- Read note content and metadata
-- Update notes (append, overwrite, or targeted patches)
-- Delete notes
-- Manage tags and front-matter fields
-- Work with the currently active file
+- Create, read, append, delete notes
+- Manage frontmatter properties (set, read, remove, list)
+- Query tasks and toggle completion
+- List tags vault-wide or per-note
+- Find backlinks and orphaned notes
+- Interact with daily notes
+- Run arbitrary JavaScript in Obsidian context (eval escape hatch)
 
 **Documentation:**
-- `obsidian-rest-api/SKILL.md` - Main skill guide
-- `obsidian-rest-api/references/api_endpoints.md` - Complete endpoint reference
-- `obsidian-rest-api/references/authentication.md` - Setup guide
-- `obsidian-rest-api/references/examples.md` - Practical examples
+- `obsidian-cli/SKILL.md` — Main skill guide and heading-insert pattern
+- `obsidian-cli/references/cli_reference.md` — Condensed command reference
+- `obsidian-cli/references/setup.md` — Platform-specific setup
 
-### 2. Omnisearch Custom Tool
+### 2. Obsidian Developer Notes Skill
+
+**Location:** `obsidian-dev-notes/`
+
+**Capabilities:**
+- Create and maintain project MOCs (Maps of Content)
+- Document architectural decisions with context and trade-offs
+- Capture reusable patterns linked to projects
+- Record learnings and insights with typed frontmatter
+- Weekly review workflow with orphan detection and daily note processing
+- Task-driven project tracking per MOC
+- Raw source ingestion (Karpathy mode or direct typed notes)
+
+**Documentation:**
+- `obsidian-dev-notes/SKILL.md` — Full workflow guide
+- `obsidian-dev-notes/references/karpathy-ingest.md` — Raw ingestion workflow
+
+### 3. Obsidian CLI Tool
+
+**Location:** `tools/obsidian.ts`
+
+**Exports (17):** `createNote`, `readNote`, `appendToNote`, `deleteNote`, `listFiles`,
+`setProperty`, `readProperty`, `removeProperty`, `listProperties`, `listTags`,
+`listTasks`, `toggleTask`, `getBacklinks`, `getOrphans`, `readDailyNote`,
+`appendToDailyNote`, `evalJs`
+
+### 4. Omnisearch Custom Tool
 
 **Location:** `tools/omnisearch.ts`
 
 **Capabilities:**
-- Full-text search across your vault
-- Fuzzy matching for flexible queries
-- Returns excerpts with context
+- Full-text fuzzy search across your vault
+- Returns scored results with excerpts and found words
 - Configurable result limits
 
 **Documentation:**
-- `docs/OMNISEARCH_TOOL.md` - Comprehensive tool guide
-- `docs/omnisearch.md` - Quick reference
+- `docs/OMNISEARCH_TOOL.md` — Comprehensive tool guide
+- `docs/omnisearch.md` — Quick reference
 
 ## Configuration
 
-### Environment Variables
+### Default Service Ports
 
-Create a `.env` file in the project root:
+- **Obsidian CLI:** No port — communicates directly with the running Obsidian app
+- **Omnisearch HTTP API:** `http://localhost:51361`
 
-```bash
-# Obsidian REST API Key
-obsidian_api_keys=YOUR_API_KEY_HERE
-```
-
-### Default API Endpoints
-
-- **REST API:** `http://localhost:27123`
-- **Omnisearch:** `http://localhost:51361`
-
-These ports are the default for the respective plugins. If you've changed them, update the tool configurations accordingly.
+No API keys or `.env` file required for CLI operations.
 
 ## Troubleshooting
 
-### REST API Not Responding
+### Obsidian CLI Not Found
 
-1. **Check if Obsidian is running**
-   ```bash
-   ps aux | grep -i obsidian
-   ```
+```bash
+obsidian version
+# If "command not found":
+```
 
-2. **Verify Local REST API plugin is enabled**
-   - Open Obsidian → Settings → Community Plugins
-   - Ensure Local REST API is enabled
+1. Verify Obsidian CLI is enabled: Settings → General → Command line interface
+2. Restart your terminal (PATH changes require a new session)
+3. See `obsidian-cli/references/setup.md` for platform-specific fixes
 
-3. **Test connection**
-   ```bash
-   curl http://localhost:27123/
-   ```
+### Obsidian CLI Not Responding
+
+- Ensure Obsidian is running (the CLI requires the app to be open)
+- Try `obsidian version` — if it hangs, restart Obsidian
 
 ### Omnisearch Not Finding Results
 
-1. **Check if HTTP server is enabled**
-   - Obsidian → Settings → Omnisearch → Enable HTTP Server
-
-2. **Verify the plugin is indexing**
-   - Try searching in Obsidian UI first
-   - Trigger a re-index if needed
-
-3. **Test the endpoint**
+1. Check HTTP server is enabled: Obsidian → Settings → Omnisearch → Enable HTTP Server
+2. Try searching in Obsidian UI first (confirms the plugin is working)
+3. Test the endpoint:
    ```bash
    curl "http://localhost:51361/search?q=test"
    ```
 
-### API Key Issues
-
-- Ensure no extra spaces in `.env` file
-- Verify the key is correctly copied from plugin settings
-- Check that `.env` is in the project root
-- Make sure `.env` is loaded: `export $(cat .env | xargs)`
-
 ## Documentation
 
-Additional documentation can be found in:
+Additional documentation:
 
-- `docs/` - General documentation and guides
-- `obsidian-rest-api/references/` - Detailed API references
-- `docs/rest-api-integration/` - Integration notes and research
+- `docs/` — General documentation and guides
+- `obsidian-cli/references/` — CLI command reference and setup
+- `docs/archive/obsidian-rest-api/` — Archived REST API skill (reference only)
+- `docs/superpowers/` — Design specs and implementation plans
 
 ## Contributing
 
@@ -231,8 +217,8 @@ Contributions are welcome! Please ensure:
 
 1. Code follows existing style conventions
 2. Documentation is updated for new features
-3. Skills include clear "when to use" descriptions
-4. Tools have comprehensive error handling
+3. Skills include clear "when to use" descriptions in frontmatter
+4. Tools have comprehensive error handling (all errors returned as JSON, never thrown)
 
 ## License
 
@@ -240,15 +226,15 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 
 ## Acknowledgments
 
-- [Obsidian](https://obsidian.md/) - The knowledge base application
-- [Local REST API Plugin](https://github.com/coddingtonbear/obsidian-local-rest-api) - REST API functionality
-- [Omnisearch Plugin](https://github.com/scambier/obsidian-omnisearch) - Search capabilities
+- [Obsidian](https://obsidian.md/) — The knowledge base application
+- [Obsidian CLI](https://obsidian.md/help/cli) — Native CLI (Obsidian 1.12+)
+- [Omnisearch Plugin](https://github.com/scambier/obsidian-omnisearch) — Search capabilities
 
 ## Version
 
-**Current Version:** 1.0.0
+**Current Version:** 2.0.0
 
 ---
 
-**Author:** Sebastian De Anda  
+**Author:** Sebastian De Anda
 **Repository:** https://github.com/sdeanda99/Obsidian_skills
