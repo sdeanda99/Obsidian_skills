@@ -68,6 +68,8 @@ function handleError(error: unknown): string {
   return JSON.stringify({ error: "CLI command failed", message: err.message }, null, 2)
 }
 
+// Bun Shell treats array interpolation as separate arguments (not shell-expanded),
+// so passing a string[] here is safe — each element becomes its own argv slot.
 async function run(args: string[]): Promise<string> {
   return (await Bun.$`${args}`.text()).trim()
 }
@@ -245,7 +247,12 @@ export const listProperties = tool({
     const { file, path, vault } = args
     try {
       const output = await run(buildArgs(vault, "properties", { file, path, format: "json" }))
-      const properties: ObsidianProperty[] = JSON.parse(output)
+      let properties: ObsidianProperty[]
+      try {
+        properties = JSON.parse(output)
+      } catch {
+        return JSON.stringify({ error: "Unexpected CLI output", raw: output }, null, 2)
+      }
       return JSON.stringify({ properties }, null, 2)
     } catch (error) {
       return handleError(error)
@@ -268,7 +275,12 @@ export const listTags = tool({
     const { file, path, sort, counts, vault } = args
     try {
       const output = await run(buildArgs(vault, "tags", { file, path, sort, counts, format: "json" }))
-      const tags: ObsidianTag[] = JSON.parse(output)
+      let tags: ObsidianTag[]
+      try {
+        tags = JSON.parse(output)
+      } catch {
+        return JSON.stringify({ error: "Unexpected CLI output", raw: output }, null, 2)
+      }
       return JSON.stringify({ tags }, null, 2)
     } catch (error) {
       return handleError(error)
@@ -292,7 +304,12 @@ export const listTasks = tool({
     const { file, path, done, todo, verbose, vault } = args
     try {
       const output = await run(buildArgs(vault, "tasks", { file, path, done, todo, verbose, format: "json" }))
-      const tasks: ObsidianTask[] = JSON.parse(output)
+      let tasks: ObsidianTask[]
+      try {
+        tasks = JSON.parse(output)
+      } catch {
+        return JSON.stringify({ error: "Unexpected CLI output", raw: output }, null, 2)
+      }
       return JSON.stringify({ tasks }, null, 2)
     } catch (error) {
       return handleError(error)
@@ -313,6 +330,13 @@ export const toggleTask = tool({
   },
   async execute(args) {
     const { line, file, path, done, todo, toggle, vault } = args
+    const flagCount = [done, todo, toggle].filter(Boolean).length
+    if (flagCount > 1) {
+      return JSON.stringify({
+        error: "Conflicting flags",
+        details: "Provide only one of: done, todo, or toggle.",
+      }, null, 2)
+    }
     try {
       const output = await run(buildArgs(vault, "task", { line, file, path, done, todo, toggle }))
       return JSON.stringify({ output }, null, 2)
@@ -335,7 +359,12 @@ export const getBacklinks = tool({
     const { file, path, vault } = args
     try {
       const output = await run(buildArgs(vault, "backlinks", { file, path, format: "json" }))
-      const backlinks: ObsidianBacklink[] = JSON.parse(output)
+      let backlinks: ObsidianBacklink[]
+      try {
+        backlinks = JSON.parse(output)
+      } catch {
+        return JSON.stringify({ error: "Unexpected CLI output", raw: output }, null, 2)
+      }
       return JSON.stringify({ backlinks }, null, 2)
     } catch (error) {
       return handleError(error)
@@ -398,7 +427,7 @@ export const appendToDailyNote = tool({
 // --- Escape Hatch ---
 
 export const evalJs = tool({
-  description: "Run JavaScript in the Obsidian app context. Advanced escape hatch — use only when no other tool covers the need. Has full access to app.vault, app.metadataCache, etc. No sandbox or timeout applied. Returns raw eval output.",
+  description: "DANGER: Runs arbitrary JavaScript in the Obsidian app context with full access to app.vault, app.metadataCache, the filesystem, and network. Can delete files or exfiltrate data. Use only when no other tool covers the need. No sandbox or timeout applied. Returns raw eval output.",
   args: {
     code: tool.schema.string().describe("JavaScript to execute. Has access to the global `app` object. Required."),
     vault: tool.schema.string().optional().describe("Vault name. Defaults to active vault."),
