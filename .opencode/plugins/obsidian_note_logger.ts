@@ -1,4 +1,4 @@
-import type { PluginContext } from "@opencode-ai/plugin"
+import type { PluginInput } from "@opencode-ai/plugin"
 import { resolve } from "path"
 import { writeFileSync, unlinkSync } from "fs"
 import { tmpdir } from "os"
@@ -62,7 +62,7 @@ function loadConfig(project: Record<string, unknown>): NoteLoggerConfig {
 
 // ── Plugin export ──────────────────────────────────────────────────────────
 
-export default async function ({ project, client, worktree }: PluginContext) {
+export default async function ({ project, client, worktree }: PluginInput) {
   const config = loadConfig(project)
   const sessions = new Map<string, SessionData>()
   const SCRIPT = resolve(import.meta.dir, "../tools/obsidian_note_writer.py")
