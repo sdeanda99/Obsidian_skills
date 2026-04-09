@@ -152,50 +152,53 @@ export default async function ({ project, client, worktree }: PluginInput) {
       const transcriptPath = `${tmpdir()}/opencode-session-${sid}.json`
       const configPath = `${tmpdir()}/opencode-config-${sid}.json`
 
+      // Single outer try/finally guarantees sessions.delete(sid) always runs
       try {
-        writeFileSync(transcriptPath, JSON.stringify(s, null, 2))
-        writeFileSync(configPath, JSON.stringify(config, null, 2))
-      } catch (err: any) {
-        await client.app.log({
-          body: {
-            service: "obsidian-note-logger",
-            level: "error",
-            message: `Failed to write IPC files: ${err.message}`,
-          },
-        })
-        return
-      }
-
-      // Shell out to Python worker
-      try {
-        const result = await Bun.$`python3 ${SCRIPT} ${transcriptPath} ${configPath} ${worktree}`.text()
-        const parsed = JSON.parse(result.trim())
-
-        if (parsed.status === "written" && config.toast_enabled) {
-          await client.tui.showToast({
-            body: { message: `Note written: ${parsed.path}`, variant: "success" },
+        try {
+          writeFileSync(transcriptPath, JSON.stringify(s, null, 2))
+          writeFileSync(configPath, JSON.stringify(config, null, 2))
+        } catch (err: any) {
+          await client.app.log({
+            body: {
+              service: "obsidian-note-logger",
+              level: "error",
+              message: `Failed to write IPC files: ${err.message}`,
+            },
           })
+          return
         }
-        // "skipped" status: no toast per spec
-      } catch (err: any) {
-        // Python exited non-zero or JSON parse failed
-        await client.app.log({
-          body: {
-            service: "obsidian-note-logger",
-            level: "error",
-            message: `Note writer failed: ${err.message}`,
-          },
-        })
-        if (config.toast_enabled) {
-          await client.tui.showToast({
-            body: { message: "Obsidian note failed — check wiki/log.md", variant: "error" },
+
+        // Shell out to Python worker
+        try {
+          const result = await Bun.$`python3 ${SCRIPT} ${transcriptPath} ${configPath} ${worktree}`.text()
+          const parsed = JSON.parse(result.trim())
+
+          if (parsed.status === "written" && config.toast_enabled) {
+            await client.tui.showToast({
+              body: { message: `Note written: ${parsed.path}`, variant: "success" },
+            })
+          }
+          // "skipped" status: no toast per spec
+        } catch (err: any) {
+          // Python exited non-zero or JSON parse failed
+          await client.app.log({
+            body: {
+              service: "obsidian-note-logger",
+              level: "error",
+              message: `Note writer failed: ${err.message}`,
+            },
           })
+          if (config.toast_enabled) {
+            await client.tui.showToast({
+              body: { message: "Obsidian note failed — check wiki/log.md", variant: "error" },
+            })
+          }
+          // Clean up temp files on failure (Python cleans them on success)
+          try { unlinkSync(transcriptPath) } catch {}
+          try { unlinkSync(configPath) } catch {}
         }
-        // Clean up temp files on failure (Python cleans them on success)
-        try { unlinkSync(transcriptPath) } catch {}
-        try { unlinkSync(configPath) } catch {}
       } finally {
-        // Remove from in-memory store
+        // Always remove from in-memory store regardless of IPC write outcome
         sessions.delete(sid)
       }
     },
