@@ -4,7 +4,7 @@
 
 **Goal:** Build an OpenCode plugin that silently captures Decisions and Patterns from development sessions into an Obsidian vault — no manual trigger required.
 
-**Architecture:** A thin TypeScript plugin (`obsidian_note_logger.ts`) wires the OpenCode event system: it accumulates tool calls and messages per session in memory, applies a threshold gate at `session.idle`, writes a JSON transcript to `/tmp`, then shells out to a Python worker (`obsidian_note_writer.py`) that runs two LLM calls (classify → generate) and writes to Obsidian via CLI.
+**Architecture:** A thin TypeScript plugin (`obsidian_note_logger.ts`) wires the OpenCode event system: it accumulates tool calls and messages per session in memory (tracking `lastObsidianWriteAt` for delta capture), applies a threshold gate at `session.idle`, writes a JSON transcript to `/tmp`, then shells out to a Python worker (`obsidian_note_writer.py`) that runs two LLM calls (classify+extract → search+generate) with structured `json_object` output, searches Omnisearch for related notes before writing, and creates or enriches notes in Obsidian via CLI.
 
 **Tech Stack:** TypeScript (Bun runtime, `@opencode-ai/plugin`), Python 3.10+ (`openai` library, stdlib only), Obsidian CLI, `openai`-compatible REST API (cloud or Ollama local).
 
@@ -172,16 +172,43 @@ Patterns must have sections: ## Problem, ## Solution, ## Usage, ## Trade-offs
 
 
 def format_transcript(session: dict) -> str:
-    """Format SessionData into a readable transcript for LLM consumption."""
-    lines = [f"Session ID: {session['sessionID']}", f"Started: {session.get('startedAt', 'unknown')}", ""]
+    """
+    Format SessionData into a readable transcript for LLM consumption.
+
+    Delta capture: if session has a lastObsidianWriteAt timestamp, only include
+    tool calls and messages AFTER that timestamp. This focuses the LLM on the
+    current "work unit" rather than the full session history, reducing context
+    bloat and improving relevance of the generated note.
+    """
+    cutoff = session.get("lastObsidianWriteAt")  # ISO 8601 or None
+
+    all_tool_calls = session.get("toolCalls", [])
+    all_messages = session.get("messages", [])
+
+    # Apply delta filter if cutoff is set
+    if cutoff:
+        tool_calls = [tc for tc in all_tool_calls if tc.get("timestamp", "") > cutoff]
+        messages = [m for m in all_messages if m.get("timestamp", "") > cutoff]
+        delta_note = f"(delta: events after {cutoff})"
+    else:
+        tool_calls = all_tool_calls
+        messages = all_messages
+        delta_note = "(full session)"
+
+    lines = [
+        f"Session ID: {session['sessionID']}",
+        f"Started: {session.get('startedAt', 'unknown')}",
+        f"Context window: {delta_note}",
+        "",
+    ]
     lines.append("=== MESSAGES ===")
-    for msg in session.get("messages", []):
+    for msg in messages:
         role = msg.get("role", "unknown").upper()
         content = (msg.get("content") or "")[:2000]  # truncate long messages
         lines.append(f"[{role}]: {content}")
     lines.append("")
     lines.append("=== TOOL CALLS ===")
-    for tc in session.get("toolCalls", []):
+    for tc in tool_calls:
         tool = tc.get("tool", "unknown")
         inp = json.dumps(tc.get("input", {}))[:500]
         out = str(tc.get("output", ""))[:500]
@@ -208,44 +235,92 @@ git commit -m "feat: add transcript loader and skill prompt loader to note write
 
 ---
 
-### Task 3: Add Gate D — LLM classification call
+### Task 3: Add Gate D — `classify_and_extract` (merged, structured output)
 
 **Files:**
 - Modify: `.opencode/tools/obsidian_note_writer.py`
 
-- [ ] **Step 1: Add `classify_session` function**
+- [ ] **Step 1: Add `ClassifyResult` dataclass and `classify_and_extract` function after `format_transcript`**
 
 ```python
-def classify_session(client, model: str, transcript: str, skill_prompt: str) -> tuple[bool, str]:
+from dataclasses import dataclass
+
+@dataclass
+class ClassifyResult:
+    should_capture: bool
+    note_type: str        # "decision" or "pattern"
+    project: str          # project name, e.g. "obsidian-note-logger"
+    topics: list          # 2-3 key topic strings
+    reasoning: str        # one-sentence explanation
+
+
+def classify_and_extract(
+    client, model: str, transcript: str, skill_prompt: str
+) -> ClassifyResult:
     """
-    Gate D: Ask LLM whether the session contains a Decision or Pattern worth capturing.
-    Returns (should_capture: bool, reasoning: str).
+    Gate D: Merged classify + context extract call using json_object structured output.
+    Returns ClassifyResult. Falls back to text parsing if provider rejects json_object mode.
+
+    Using json_object mode (not json_schema) for broad provider compatibility:
+    - OpenAI: full support
+    - Anthropic-compatible: supported
+    - Ollama: supported on most models (graceful fallback if not)
     """
     system = f"""{skill_prompt}
 
-You are a classifier. Your job is to decide if an OpenCode development session
-contains content worth capturing as a Decision or Pattern in a developer knowledge base.
+You are a classifier and context extractor. Analyze this OpenCode session transcript and
+return a JSON object with these exact fields:
+{{
+  "should_capture": true or false,
+  "note_type": "decision" or "pattern",
+  "project": "kebab-case-project-name",
+  "topics": ["topic1", "topic2"],
+  "reasoning": "One sentence explaining why this should or should not be captured."
+}}
 
-Answer with YES or NO on the first line, followed by one sentence of reasoning.
-Example:
-YES - This session documents an architectural choice between two database strategies.
-NO - This session only contains trivial file edits with no decision-making.
+Capture if: the session contains an architectural decision, a technical trade-off choice,
+or a reusable solution pattern worth preserving in a developer knowledge base.
+Do not capture if: the session is exploratory, trivial, or contains no clear outcome.
 """
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"Session transcript:\n\n{transcript}"},
-        ],
-        max_tokens=100,
-        temperature=0,
+    # Try json_object mode first (structured output)
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"Session transcript:\n\n{transcript}"},
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=200,
+            temperature=0,
+        )
+        data = json.loads(response.choices[0].message.content)
+    except Exception:
+        # Fallback: call without response_format, parse text manually
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"Session transcript:\n\n{transcript}"},
+            ],
+            max_tokens=200,
+            temperature=0,
+        )
+        raw = response.choices[0].message.content.strip()
+        # Strip markdown fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        data = json.loads(raw)  # raises ValueError if still not JSON — caller handles
+
+    return ClassifyResult(
+        should_capture=bool(data.get("should_capture", False)),
+        note_type=data.get("note_type", "decision"),
+        project=data.get("project", "unknown"),
+        topics=data.get("topics", []),
+        reasoning=data.get("reasoning", ""),
     )
-    reply = response.choices[0].message.content.strip()
-    should_capture = reply.upper().startswith("YES")
-    # Extract reasoning (everything after the first word/dash)
-    parts = reply.split("-", 1)
-    reasoning = parts[1].strip() if len(parts) > 1 else reply
-    return should_capture, reasoning
 ```
 
 - [ ] **Step 2: Verify syntax**
@@ -260,64 +335,207 @@ Expected: `OK`
 
 ```bash
 git add .opencode/tools/obsidian_note_writer.py
-git commit -m "feat: add LLM classification gate to note writer"
+git commit -m "feat: add classify_and_extract with json_object structured output"
 ```
 
 ---
 
-### Task 4: Add note generation — second LLM call
+### Task 3b: Add `search_related_notes` — Omnisearch dedup check
 
 **Files:**
 - Modify: `.opencode/tools/obsidian_note_writer.py`
 
-- [ ] **Step 1: Add `generate_note` function**
+- [ ] **Step 1: Add `search_related_notes` function after `classify_and_extract`**
 
 ```python
-def generate_note(client, model: str, transcript: str, skill_prompt: str, reasoning: str) -> dict:
+import urllib.request
+import urllib.parse
+
+
+def search_related_notes(
+    project: str,
+    topics: list,
+    note_type: str,
+    vault: str | None,
+    score_threshold: int = 15,
+) -> list:
+    """
+    Search Omnisearch for existing notes related to the project and topics.
+    Returns list of {"path": str, "content": str} dicts (up to 2).
+    Returns [] gracefully on any error (Omnisearch unavailable, timeout, etc.).
+
+    Filters results to only notes in the folder matching note_type:
+    - "decision" → Decisions/
+    - "pattern"  → Patterns/
+    """
+    folder_prefix = "Decisions/" if note_type.lower() == "decision" else "Patterns/"
+    query = f"{project} {' '.join(topics)}"
+    encoded = urllib.parse.quote(query)
+    url = f"http://localhost:51361/search?q={encoded}"
+
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            if resp.status != 200:
+                return []
+            results = json.loads(resp.read().decode())
+    except Exception:
+        return []  # Omnisearch unavailable — graceful degradation
+
+    # Filter by folder and score threshold
+    matches = [
+        r for r in results
+        if r.get("path", "").startswith(folder_prefix)
+        and r.get("score", 0) >= score_threshold
+    ]
+
+    # Read top 2 note contents via Obsidian CLI
+    related = []
+    for match in matches[:2]:
+        path = match["path"]
+        code, content, _ = obsidian_run(["read", f"path={path}"], vault=vault)
+        if code == 0 and content:
+            related.append({"path": path, "content": content})
+
+    return related
+```
+
+- [ ] **Step 2: Verify syntax**
+
+```bash
+python3 -c "import ast; ast.parse(open('.opencode/tools/obsidian_note_writer.py').read()); print('OK')"
+```
+
+Expected: `OK`
+
+- [ ] **Step 3: Verify `urllib` imports don't conflict (stdlib — no pip install needed)**
+
+```bash
+python3 -c "import urllib.request, urllib.parse; print('OK')"
+```
+
+Expected: `OK`
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add .opencode/tools/obsidian_note_writer.py
+git commit -m "feat: add search_related_notes for Omnisearch dedup check"
+```
+
+---
+
+### Task 4: Add note generation — second LLM call (enrich or create)
+
+**Files:**
+- Modify: `.opencode/tools/obsidian_note_writer.py`
+
+- [ ] **Step 1: Add `generate_note` function after `search_related_notes`**
+
+```python
+def generate_note(
+    client,
+    model: str,
+    transcript: str,
+    skill_prompt: str,
+    classification: ClassifyResult,
+    existing_notes: list,
+) -> dict:
     """
     Generate a structured Obsidian note from the session transcript.
-    Returns dict with keys: path (str), content (str).
-    Raises ValueError if LLM output is not valid JSON.
+    If existing_notes is non-empty, LLM decides whether to enrich one or create new.
+
+    Returns dict with keys:
+      action: "create" | "enrich"
+      path: vault-relative path for the note
+      content: complete markdown content (full note, not a diff)
+      existing_path: same as path for enrich, null for create
+
+    Raises ValueError if LLM output is not valid JSON or missing required keys.
+    Uses json_object mode with markdown-fence fallback (same pattern as classify_and_extract).
     """
     today = datetime.date.today().isoformat()
+
+    existing_block = ""
+    if existing_notes:
+        parts = []
+        for n in existing_notes:
+            parts.append(f"### Existing note: {n['path']}\n\n{n['content'][:3000]}")
+        existing_block = (
+            "\n\n## Existing Related Notes\n\n"
+            + "\n\n---\n\n".join(parts)
+            + "\n\nDecide: should you ENRICH one of these notes with the new content, "
+            "or CREATE a new note? Enrich if the session clearly extends the same topic. "
+            "Create if the content is sufficiently distinct."
+        )
+
     system = f"""{skill_prompt}
 
 You are a developer knowledge base writer. Given an OpenCode session transcript,
-write a structured note capturing the key Decision or Pattern.
+write or update a structured Obsidian note capturing the key {classification.note_type}.
 
-You MUST respond with valid JSON only — no markdown fences, no preamble:
+You MUST respond with a JSON object using json_object mode — no markdown fences:
 {{
+  "action": "create" or "enrich",
   "path": "Decisions/YYYY-MM-DD-short-slug.md",
-  "content": "---\\ntype: decision\\nproject: project-name\\n...\\n---\\n\\n## Context\\n..."
+  "content": "---\\ntype: {classification.note_type}\\nproject: {classification.project}\\n...\\n---\\n\\n## Context\\n...",
+  "existing_path": null or "Decisions/existing-note.md"
 }}
 
 Rules:
+- action "enrich": set existing_path to the path being updated, path = existing_path
+- action "create": set existing_path to null
 - path must start with Decisions/ or Patterns/ matching the note type
-- path filename format: YYYY-MM-DD-kebab-case-slug.md (today is {today})
-- content must include full YAML frontmatter block followed by markdown body
+- path filename (for create): YYYY-MM-DD-kebab-case-slug.md (today is {today})
+- content is the COMPLETE note after enrichment (not a diff — full replacement)
 - frontmatter fields: type, project, status (decisions only), tags, created, updated
 - created and updated should be {today}
 - Use the schema from the skill instructions above for section headings
-- Be specific — extract actual decisions/patterns from the transcript, not generic summaries
+- Be specific — extract actual content from the transcript, not generic summaries
+{existing_block}
 """
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"Classification reasoning: {reasoning}\n\nSession transcript:\n\n{transcript}"},
-        ],
-        max_tokens=2000,
-        temperature=0.3,
-    )
-    raw = response.choices[0].message.content.strip()
-    # Strip markdown code fences if LLM added them despite instructions
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    note = json.loads(raw)  # raises ValueError on malformed JSON
-    assert "path" in note and "content" in note, "LLM response missing 'path' or 'content' keys"
-    return note
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": (
+                    f"Project: {classification.project}\n"
+                    f"Topics: {', '.join(classification.topics)}\n"
+                    f"Classification: {classification.reasoning}\n\n"
+                    f"Session transcript:\n\n{transcript}"
+                )},
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=2000,
+            temperature=0.3,
+        )
+        data = json.loads(response.choices[0].message.content)
+    except Exception:
+        # Fallback: call without response_format
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": (
+                    f"Project: {classification.project}\n"
+                    f"Topics: {', '.join(classification.topics)}\n"
+                    f"Classification: {classification.reasoning}\n\n"
+                    f"Session transcript:\n\n{transcript}"
+                )},
+            ],
+            max_tokens=2000,
+            temperature=0.3,
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        data = json.loads(raw)
+
+    assert "action" in data and "path" in data and "content" in data, \
+        f"LLM response missing required keys: {list(data.keys())}"
+    return data
 ```
 
 - [ ] **Step 2: Verify syntax**
@@ -332,7 +550,7 @@ Expected: `OK`
 
 ```bash
 git add .opencode/tools/obsidian_note_writer.py
-git commit -m "feat: add LLM note generation call to note writer"
+git commit -m "feat: add generate_note with enrich/create branch and json_object mode"
 ```
 
 ---
@@ -406,6 +624,11 @@ def insert_moc_link(note_path: str, note_type: str, vault: str | None) -> tuple[
     wikilink = f"- [[{note_stem}]]"
 
     lines = moc_content.splitlines()
+
+    # Skip insert if wikilink already exists (prevents duplicates on enrich path)
+    if wikilink in moc_content:
+        return True, ""
+
     insert_idx = None
     for i, line in enumerate(lines):
         if line.strip() == heading:
@@ -543,31 +766,47 @@ if __name__ == "__main__":
         print(f"Failed to build LLM client: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # --- Gate D: Classify ---
+    # --- Gate D: Classify & Extract ---
     try:
-        should_capture, reasoning = classify_session(client, model, transcript_text, skill_prompt)
+        classification = classify_and_extract(client, model, transcript_text, skill_prompt)
     except Exception as e:
         print(f"LLM classification failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    if not should_capture:
+    if not classification.should_capture:
         append_log(config, vault, (
             f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — Skipped (not a decision/pattern)\n"
             f"- **Session:** {session_id}\n"
-            f"- **Reason:** {reasoning}"
+            f"- **Reason:** {classification.reasoning}"
         ))
-        # Print machine-readable result for plugin to parse
-        print(json.dumps({"status": "skipped", "reason": reasoning}))
-        # Clean up temp file
+        print(json.dumps({"status": "skipped", "reason": classification.reasoning}))
         try:
             Path(transcript_path).unlink()
         except Exception:
             pass
         sys.exit(0)
 
-    # --- Generate note ---
+    # --- Pre-Write Search (dedup check) ---
+    dedup_label = ""
     try:
-        note = generate_note(client, model, transcript_text, skill_prompt, reasoning)
+        existing_notes = search_related_notes(
+            classification.project, classification.topics,
+            classification.note_type, vault
+        )
+        if existing_notes:
+            dedup_label = f"Found {len(existing_notes)} related"
+        else:
+            dedup_label = "No matches"
+    except Exception:
+        existing_notes = []
+        dedup_label = "Skipped (Omnisearch unavailable)"
+
+    # --- Generate note (enrich or create) ---
+    try:
+        note = generate_note(
+            client, model, transcript_text, skill_prompt,
+            classification, existing_notes
+        )
     except (ValueError, AssertionError, Exception) as e:
         print(f"Note generation failed: {e}", file=sys.stderr)
         append_log(config, vault, (
@@ -577,29 +816,59 @@ if __name__ == "__main__":
         ))
         sys.exit(1)
 
+    action = note.get("action", "create")
     note_path = note["path"]
     note_content = note["content"]
+    existing_path = note.get("existing_path")
+    note_type = classification.note_type
 
-    # Detect note type from path prefix
-    note_type = "decision" if note_path.startswith("Decisions/") else "pattern"
+    # --- Write note to Obsidian (create or enrich) ---
+    if action == "enrich" and existing_path:
+        overwrite_flag = "overwrite=true"
+        write_path = existing_path
+        action_label = f"Enriched {existing_path}"
+    else:
+        overwrite_flag = "overwrite=false"
+        write_path = note_path
+        action_label = "Created"
 
-    # --- Write note to Obsidian ---
-    success, err = write_note(note_path, note_content, vault)
-    if not success:
-        print(f"Obsidian write failed: {err}", file=sys.stderr)
-        append_log(config, vault, (
-            f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — ERROR: write failed\n"
-            f"- **Session:** {session_id}\n"
-            f"- **Error:** obsidian CLI returned non-zero exit code\n"
-            f"- **Raw:** {err}"
-        ))
-        sys.exit(1)
+    write_args = ["create", f"path={write_path}", f"content={note_content}", overwrite_flag]
+    code, stdout, stderr = obsidian_run(write_args, vault=vault)
+    if code != 0:
+        err = stderr or stdout or "Unknown CLI error"
+        # Enrich fallback: if enrich write failed, retry as create at new path
+        if action == "enrich":
+            write_args = ["create", f"path={note_path}", f"content={note_content}", "overwrite=false"]
+            code2, _, stderr2 = obsidian_run(write_args, vault=vault)
+            if code2 == 0:
+                action_label = f"Created (enrich fallback — original write failed: {err})"
+                write_path = note_path
+            else:
+                print(f"Obsidian write failed: {err}", file=sys.stderr)
+                append_log(config, vault, (
+                    f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — ERROR: write failed\n"
+                    f"- **Session:** {session_id}\n"
+                    f"- **Error:** obsidian CLI returned non-zero exit code\n"
+                    f"- **Raw:** {err}"
+                ))
+                sys.exit(1)
+        else:
+            print(f"Obsidian write failed: {err}", file=sys.stderr)
+            append_log(config, vault, (
+                f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — ERROR: write failed\n"
+                f"- **Session:** {session_id}\n"
+                f"- **Error:** obsidian CLI returned non-zero exit code\n"
+                f"- **Raw:** {err}"
+            ))
+            sys.exit(1)
 
-    # --- MOC insert (best-effort) ---
-    moc_ok, moc_warn = insert_moc_link(note_path, note_type, vault)
+    # --- MOC insert (best-effort, skip duplicate wikilinks) ---
+    moc_ok, moc_warn = insert_moc_link(write_path, note_type, vault)
     moc_note = f"\n- **MOC warning:** {moc_warn}" if not moc_ok else ""
 
     # --- Transaction log ---
+    cutoff = session.get("lastObsidianWriteAt")
+    delta_window = f"since {cutoff}" if cutoff else "full session"
     tool_count = len(session.get("toolCalls", []))
     msg_count = len(session.get("messages", []))
     base_url = config.get("base_url") or "cloud"
@@ -607,12 +876,15 @@ if __name__ == "__main__":
     append_log(config, vault, (
         f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — {note_type.capitalize()} captured\n"
         f"- **Session:** {session_id}\n"
-        f"- **Note:** {note_path}\n"
+        f"- **Action:** {action_label}\n"
+        f"- **Note:** {write_path}\n"
         f"- **Model:** {model} ({provider_label})\n"
         f"- **Classified as:** {note_type.capitalize()}\n"
         f"- **Tool calls logged:** {tool_count}\n"
         f"- **Messages logged:** {msg_count}\n"
-        f"- **Classification reasoning:** {reasoning}{moc_note}"
+        f"- **Delta window:** {delta_window}\n"
+        f"- **Dedup check:** {dedup_label}\n"
+        f"- **Classification reasoning:** {classification.reasoning}{moc_note}"
     ))
 
     # --- OS notification ---
@@ -640,7 +912,7 @@ Expected: `OK`
 - [ ] **Step 3: Run a dry-run with a minimal test transcript to verify argument parsing**
 
 ```bash
-echo '{"sessionID":"test-123","toolCalls":[],"messages":[],"startedAt":"2026-04-08T00:00:00Z"}' > /tmp/test-transcript.json
+echo '{"sessionID":"test-123","toolCalls":[],"messages":[],"startedAt":"2026-04-08T00:00:00Z","lastObsidianWriteAt":null}' > /tmp/test-transcript.json
 echo '{"model":"claude-haiku-4-5","base_url":null,"api_key":null,"vault":null,"note_skill":"obsidian-dev-notes","min_tool_calls":2,"min_messages":3,"log_path":"wiki/log.md","log_enabled":false,"toast_enabled":true,"os_notify":false}' > /tmp/test-config.json
 python3 .opencode/tools/obsidian_note_writer.py /tmp/test-transcript.json /tmp/test-config.json
 ```
@@ -743,6 +1015,7 @@ interface SessionData {
   toolCalls: ToolCall[]
   messages: Message[]
   startedAt: string
+  lastObsidianWriteAt: string | null  // updated when any Obsidian tool fires (Option B)
 }
 
 interface NoteLoggerConfig {
@@ -784,6 +1057,14 @@ export default async function ({ project, client, worktree }: PluginContext) {
   const config = loadConfig(project)
   const sessions = new Map<string, SessionData>()
   const SCRIPT = resolve(__dirname, "../tools/obsidian_note_writer.py")
+
+  // Obsidian tool names — any of these firing updates lastObsidianWriteAt (Option B)
+  const OBSIDIAN_TOOLS = new Set([
+    "createNote", "readNote", "appendToNote", "deleteNote", "listFiles",
+    "setProperty", "readProperty", "removeProperty", "listProperties",
+    "listTags", "listTasks", "toggleTask", "getBacklinks", "getOrphans",
+    "readDailyNote", "appendToDailyNote", "evalJs",
+  ])
 
   await client.app.log({
     body: {
@@ -836,15 +1117,22 @@ Replace `return { // hooks go here in Tasks 10-12 }` with:
           toolCalls: [],
           messages: [],
           startedAt: new Date().toISOString(),
+          lastObsidianWriteAt: null,
         })
       }
       const s = sessions.get(sid)!
+      const toolName = event.tool ?? "unknown"
+      const now = new Date().toISOString()
       s.toolCalls.push({
-        tool: event.tool ?? "unknown",
+        tool: toolName,
         input: event.input ?? {},
         output: event.output ?? "",
-        timestamp: new Date().toISOString(),
+        timestamp: now,
       })
+      // Delta capture: track last Obsidian vault touch (Option B)
+      if (OBSIDIAN_TOOLS.has(toolName)) {
+        s.lastObsidianWriteAt = now
+      }
     },
 
     "message.updated": async (event: any) => {
@@ -856,6 +1144,7 @@ Replace `return { // hooks go here in Tasks 10-12 }` with:
           toolCalls: [],
           messages: [],
           startedAt: new Date().toISOString(),
+          lastObsidianWriteAt: null,
         })
       }
       const s = sessions.get(sid)!
@@ -1142,20 +1431,26 @@ cat > /tmp/smoke-transcript.json << 'EOF'
 {
   "sessionID": "smoke-test-001",
   "toolCalls": [
-    {"tool": "read", "input": {"path": "src/plugin.ts"}, "output": "file contents...", "timestamp": "2026-04-08T10:00:00Z"},
+    {"tool": "read", "input": {"path": "src/plugin.ts"}, "output": "file contents...", "timestamp": "2026-04-08T09:50:00Z"},
+    {"tool": "createNote", "input": {"path": "Projects/obsidian-note-logger.md"}, "output": "created", "timestamp": "2026-04-08T10:00:00Z"},
     {"tool": "edit", "input": {"path": "src/plugin.ts", "change": "added session.idle hook"}, "output": "success", "timestamp": "2026-04-08T10:01:00Z"},
     {"tool": "bash", "input": {"command": "bun check src/plugin.ts"}, "output": "No errors", "timestamp": "2026-04-08T10:02:00Z"}
   ],
   "messages": [
-    {"id": "m1", "role": "user", "content": "Add session.idle handling to the plugin", "timestamp": "2026-04-08T10:00:00Z"},
-    {"id": "m2", "role": "assistant", "content": "I'll add the session.idle hook to capture when the agent finishes responding.", "timestamp": "2026-04-08T10:00:05Z"},
+    {"id": "m1", "role": "user", "content": "Add session.idle handling to the plugin", "timestamp": "2026-04-08T09:49:00Z"},
+    {"id": "m2", "role": "assistant", "content": "I'll add the session.idle hook to capture when the agent finishes responding.", "timestamp": "2026-04-08T09:50:05Z"},
     {"id": "m3", "role": "user", "content": "Make sure it uses the threshold gate", "timestamp": "2026-04-08T10:01:00Z"},
     {"id": "m4", "role": "assistant", "content": "Done — I've added min_tool_calls and min_messages threshold checks before writing the transcript.", "timestamp": "2026-04-08T10:01:10Z"}
   ],
-  "startedAt": "2026-04-08T10:00:00Z"
+  "startedAt": "2026-04-08T09:49:00Z",
+  "lastObsidianWriteAt": "2026-04-08T10:00:00Z"
 }
 EOF
 ```
+
+Note: `lastObsidianWriteAt` is set to `10:00:00Z` (when `createNote` fired). The delta
+filter in `format_transcript` will only include the `edit` and `bash` tool calls and
+messages `m3`/`m4` — verifying the delta capture works correctly.
 
 - [ ] **Step 3: Create a test config pointing at a non-existent vault (to test error handling)**
 

@@ -30,33 +30,54 @@ the established Builder Kit pattern.
 ```
 tool.execute.after  ──┐
                       ├─→ in-memory Map<sessionID, SessionData>
-message.updated     ──┘         │
+message.updated     ──┘         │ (Obsidian tool? → update lastObsidianWriteAt)
                                 ▼
                          session.idle fires
                                 │
                          threshold gate (B)
                          min_tool_calls + min_messages
+                         (applied to FULL session counts)
+                                │
+                         format_transcript
+                         (delta filter: only events after
+                          lastObsidianWriteAt if set)
                                 │
                          write /tmp/opencode-session-<id>.json
                                 │
                          shell out → obsidian_note_writer.py
                                 │
-                    ┌───────────┴───────────┐
-                    ▼                       ▼
-             LLM call #1            (if NO → skip)
-           classify: Decision
-           or Pattern? YES/NO
+                    ┌───────────┴────────────┐
+                    ▼                        ▼
+             LLM call #1             (if NO → log + skip)
+           classify & extract
+           → ClassifyResult
+           { should_capture, note_type,
+             project, topics, reasoning }
+           [json_object mode]
+                    │
+                    ▼
+           search Omnisearch :51361
+           query: "<project> <topics>"
+           filter: Decisions/ or Patterns/
+           score ≥ 15, top 2
+           read matching notes via CLI
+           (skip gracefully if unavailable)
                     │
                     ▼
              LLM call #2
-           generate note content
-           following obsidian-dev-notes
-           schema
+           generate note (enrich or create)
+           → { action, path, content,
+               existing_path? }
+           [json_object mode]
                     │
+              ┌─────┴──────┐
+              ▼            ▼
+           create        enrich
+         overwrite=    overwrite=
+           false          true
+              └─────┬──────┘
                     ▼
-           obsidian CLI shell-out
-           createNote + setProperty × N
-           (+ MOC heading insert)
+           MOC heading insert
                     │
                     ▼
            append to wiki/log.md
@@ -96,9 +117,26 @@ interface SessionData {
   sessionID: string
   toolCalls: ToolCall[]
   messages: Message[]
-  startedAt: string   // ISO 8601
+  startedAt: string              // ISO 8601
+  lastObsidianWriteAt: string | null  // ISO 8601 — updated whenever an Obsidian tool fires
 }
 ```
+
+**Delta capture:** `lastObsidianWriteAt` is updated in `tool.execute.after` whenever
+`event.tool` matches any of the 17 Obsidian tool names (Option B — any vault touch resets
+the window):
+
+```
+createNote, readNote, appendToNote, deleteNote, listFiles,
+setProperty, readProperty, removeProperty, listProperties,
+listTags, listTasks, toggleTask, getBacklinks, getOrphans,
+readDailyNote, appendToDailyNote, evalJs
+```
+
+The Python worker's `format_transcript` applies this boundary: if `lastObsidianWriteAt`
+is set, only `toolCalls` and `messages` with `timestamp > lastObsidianWriteAt` are
+included in the transcript sent to the LLM. If `null`, the full session is used. This
+ensures the LLM only reasons about the current "work unit" — not the full session history.
 
 **IPC temp file:** At `session.idle` (after threshold gate passes), the plugin writes the
 `SessionData` object to `/tmp/opencode-session-<sessionID>.json` as JSON. This exact
@@ -107,7 +145,7 @@ The temp file is deleted by the Python script on successful completion, or by th
 on Python script failure (non-zero exit).
 
 **Event hooks:**
-- `tool.execute.after` → append to `toolCalls`
+- `tool.execute.after` → append to `toolCalls`; update `lastObsidianWriteAt` if Obsidian tool
 - `message.updated` → upsert by `event.messageID` into `messages` (handles streaming — last write wins)
 - `session.idle` → run threshold gate, write temp file, shell out to Python script
 - `session.deleted` → delete in-memory `SessionData` entry only (temp file already handled by `session.idle` path or never created if threshold not met)
@@ -139,18 +177,65 @@ stores an empty string — it never throws.
 - Skip session if `messages.length < config.min_messages` (default: 3)
 - Skipped sessions are silently discarded (no toast, no log entry)
 
-### Gate D — LLM Classification (in Python script, first LLM call)
+### Gate D — LLM Classify & Extract (in Python script, merged first LLM call)
 
-System prompt: *"You are a classifier. Given this OpenCode session transcript, answer
-YES or NO: does this session contain a Decision or Pattern worth capturing in a
-developer knowledge base? Reply with YES or NO followed by one sentence of reasoning."*
+Classification and context extraction are merged into one call — the LLM reads the
+transcript once and returns everything needed for the search and generation steps.
 
-The Python script parses the classification response with a simple `strip().upper().startswith("YES")`
-check — no regex, no structured output required. The remainder of the response is captured
-as `classification_reasoning` for the log entry.
+Uses `response_format={"type": "json_object"}` (broadly supported across OpenAI,
+Anthropic-compatible, and most Ollama models). Falls back to text parsing if the provider
+rejects JSON mode (e.g., older Ollama builds).
 
-- If NO → append a `"skipped: <reason>"` entry to log (if `log_enabled`) and exit 0
-- If YES → proceed to note generation
+**Output schema** (`ClassifyResult` dataclass):
+```json
+{
+  "should_capture": true,
+  "note_type": "decision",
+  "project": "obsidian-note-logger",
+  "topics": ["session.idle", "event trigger", "background agent"],
+  "reasoning": "Session documents the architectural choice to use session.idle as the trigger."
+}
+```
+
+- `should_capture: false` → append a `"skipped: <reason>"` entry to log and exit 0
+- `should_capture: true` → proceed to Pre-Write Search with `project` and `topics`
+- If LLM returns neither true nor false (malformed) → treat as `false`, log skipped, exit 0
+
+---
+
+## Pre-Write Search (Dedup Check)
+
+Before generating a new note, the Python worker searches the vault for existing notes on
+the same project and topic. This implements the `obsidian-dev-notes` core rule:
+**"Search Before Creating."**
+
+### Search Step
+
+1. Build query: `f"{project} {' '.join(topics)}"` from the `ClassifyResult`
+2. `urllib.request.urlopen(f"http://localhost:51361/search?q={urllib.parse.quote(query)}", timeout=3)`
+3. Filter results:
+   - Path must start with `Decisions/` or `Patterns/` (matching `note_type`)
+   - Score must be ≥ 15 (Omnisearch score scale — filters out weak matches)
+4. Read top 2 matching notes via `obsidian read path=<path>`
+5. Pass `existing_notes: list[{"path": str, "content": str}]` to generation call
+
+### Graceful Degradation
+
+If Omnisearch is unavailable (any exception: `ECONNREFUSED`, timeout, non-200 response):
+- Skip search entirely
+- Pass `existing_notes=[]` to generation
+- Log `"dedup_check: skipped (Omnisearch unavailable)"` in transaction entry
+- Note is created new — no error toast, no exit 1
+
+### Enrich vs Create Decision
+
+If `existing_notes` is non-empty, the generation LLM decides:
+- **Enrich:** the session's content clearly extends an existing note on the same topic
+- **Create:** the content is sufficiently distinct to warrant a new note
+
+The LLM output includes `action: "enrich" | "create"`. For `"enrich"`, it also returns
+`existing_path` (the vault path of the note to update). The Python script then reads the
+existing note, passes it along with the new content to overwrite with `overwrite=true`.
 
 ---
 
@@ -191,37 +276,38 @@ No additional dependencies — same `openai` Python library handles it.
 
 The second LLM call receives:
 
-- Full session transcript (tool calls + messages)
+- Delta transcript (tool calls + messages since `lastObsidianWriteAt`, or full session if null)
 - System prompt instructing it to follow the `obsidian-dev-notes` skill schema
-- Classification result from Gate D
-- Target note type: Decision or Pattern
+- `ClassifyResult` (note type, project, topics, reasoning)
+- `existing_notes` — list of `{"path", "content"}` dicts from the search step (may be empty)
 
-Output is a JSON object with two keys:
+**Output JSON schema** (`json_object` mode):
 ```json
 {
+  "action": "create",
   "path": "Decisions/2026-04-08-slug.md",
-  "content": "---\ntype: decision\n...\n---\n\n## Context\n..."
+  "content": "---\ntype: decision\n...\n---\n\n## Context\n...",
+  "existing_path": null
 }
 ```
 
-The LLM generates the complete markdown including YAML frontmatter inline. The Python
-script parses this JSON with a dedicated try/catch — a JSON parse error is treated as
-a classification failure (logged, toast shown, exit 0).
+For `action: "enrich"`, `existing_path` is set to the vault path being enriched and
+`path` holds the same value. `content` is the **complete** replacement content for the
+existing note (full note, not a diff).
+
+The Python script parses this JSON with a dedicated try/catch — a JSON parse error is
+treated as a failure (logged, red toast, exit 1).
 
 The Python script then:
-1. Calls `obsidian create path=<path> content=<content> overwrite=false` — the full
-   markdown (including frontmatter) is passed as `content`. The Obsidian CLI parses
-   frontmatter from the note body on create. **No separate `property:set` calls are
-   made** — the LLM-generated frontmatter in `content` is the authoritative source.
-2. **MOC insert:** The project MOC is located by reading the `project` frontmatter field
-   from the generated note. The MOC path is resolved as `Projects/<project>.md` (vault-
-   relative, per `obsidian-dev-notes` folder schema). The Python script calls
-   `obsidian read path=Projects/<project>.md`, finds the `## Decisions` or `## Patterns`
-   heading (matching the note type), and splices a wikilink after it using the read-
-   modify-overwrite pattern (`obsidian create ... overwrite=true`). If the MOC does not
-   exist, the step is skipped and a warning is appended to the log entry — note creation
-   still succeeds.
-3. Appends transaction log entry to `wiki/log.md`.
+1. **Create branch** (`action: "create"`): calls `obsidian create path=<path> content=<content> overwrite=false`
+2. **Enrich branch** (`action: "enrich"`): calls `obsidian create path=<existing_path> content=<content> overwrite=true`
+   - If the read of the existing note fails before overwrite, falls back to `create` at a new path and logs a warning
+3. **No separate `property:set` calls** — LLM-generated frontmatter in `content` is authoritative
+4. **MOC insert:** The MOC path is resolved as `Projects/<project>.md`. The Python script
+   finds the `## Decisions` or `## Patterns` heading and splices a wikilink using the
+   read-modify-overwrite pattern. For `enrich`, the wikilink is only added if it doesn't
+   already exist in the MOC. If the MOC does not exist, step is skipped with a warning.
+5. Appends transaction log entry to `wiki/log.md`.
 
 ---
 
@@ -232,11 +318,14 @@ Each entry appended to `wiki/log.md` (vault-relative):
 ```markdown
 ## 2026-04-08 14:32 — Decision captured
 - **Session:** ses_abc123
+- **Action:** Created | Enriched Decisions/existing-note.md
 - **Note:** Decisions/2026-04-08-use-session-idle-for-trigger.md
 - **Model:** llama3.2 (ollama)
 - **Classified as:** Decision
 - **Tool calls logged:** 7
 - **Messages logged:** 12
+- **Delta window:** since 14:15 (last Obsidian write) | full session
+- **Dedup check:** Found 2 related / No matches / Skipped (Omnisearch unavailable)
 - **Classification reasoning:** Session documents an architectural trigger choice
 ```
 
@@ -272,12 +361,15 @@ unrecoverable error occurs. Internal failure modes and their handling:
 | JSON parse error on temp file | Exit 1 (plugin shows red toast) |
 | LLM API call fails (network, auth) | Log error entry, exit 1 |
 | LLM returns malformed JSON for note | Log error entry, exit 1 |
-| Classification returns neither YES nor NO | Treat as NO, log skipped entry, exit 0 |
+| Classification returns neither YES nor NO | Treat as `should_capture: false`, log skipped entry, exit 0 |
 | `obsidian create` CLI non-zero exit | Log error entry, exit 1 |
 | MOC not found for wikilink insert | Log warning in entry, skip MOC step, exit 0 |
+| Wikilink already in MOC (enrich path) | Skip MOC insert silently — no duplicate links |
 | `wiki/log.md` write fails | Silently skip log write, still exit 0 if note succeeded |
 | `wiki/log.md` does not exist | Python script uses `obsidian append` which creates the file automatically; no pre-check needed |
 | `note_skill` SKILL.md not found | Log warning, proceed with a built-in fallback system prompt that encodes the obsidian-dev-notes schema inline |
+| Omnisearch unavailable (any exception) | Skip search, pass `existing_notes=[]`, proceed to create new, log `"dedup_check: skipped (Omnisearch unavailable)"` |
+| Enrich: existing note read fails | Fall back to create new note at new path, log warning |
 
 ### Temp File Lifecycle
 - Created: by plugin at `session.idle` after threshold gate passes
@@ -386,4 +478,3 @@ Full config block in `opencode.json`:
 - `session.diff` integration (investigate post-MVP)
 - `todo.updated` trigger (undocumented payload, deferred)
 - Web UI for log viewing
-- Note editing / updating existing notes (create-only for v1)
