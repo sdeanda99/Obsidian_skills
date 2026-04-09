@@ -138,6 +138,68 @@ export default async function ({ project, client, worktree }: PluginContext) {
       }
     },
 
+    "session.idle": async (event: any) => {
+      const sid = event.sessionID ?? event.id
+      if (!sid) return
+      const s = sessions.get(sid)
+      if (!s) return
+
+      // Gate B: threshold check
+      if (s.toolCalls.length < config.min_tool_calls) return
+      if (s.messages.length < config.min_messages) return
+
+      // Write transcript and config to temp files
+      const transcriptPath = `${tmpdir()}/opencode-session-${sid}.json`
+      const configPath = `${tmpdir()}/opencode-config-${sid}.json`
+
+      try {
+        writeFileSync(transcriptPath, JSON.stringify(s, null, 2))
+        writeFileSync(configPath, JSON.stringify(config, null, 2))
+      } catch (err: any) {
+        await client.app.log({
+          body: {
+            service: "obsidian-note-logger",
+            level: "error",
+            message: `Failed to write IPC files: ${err.message}`,
+          },
+        })
+        return
+      }
+
+      // Shell out to Python worker
+      try {
+        const result = await Bun.$`python3 ${SCRIPT} ${transcriptPath} ${configPath} ${worktree}`.text()
+        const parsed = JSON.parse(result.trim())
+
+        if (parsed.status === "written" && config.toast_enabled) {
+          await client.tui.showToast({
+            body: { message: `Note written: ${parsed.path}`, variant: "success" },
+          })
+        }
+        // "skipped" status: no toast per spec
+      } catch (err: any) {
+        // Python exited non-zero or JSON parse failed
+        await client.app.log({
+          body: {
+            service: "obsidian-note-logger",
+            level: "error",
+            message: `Note writer failed: ${err.message}`,
+          },
+        })
+        if (config.toast_enabled) {
+          await client.tui.showToast({
+            body: { message: "Obsidian note failed — check wiki/log.md", variant: "error" },
+          })
+        }
+        // Clean up temp files on failure (Python cleans them on success)
+        try { unlinkSync(transcriptPath) } catch {}
+        try { unlinkSync(configPath) } catch {}
+      } finally {
+        // Remove from in-memory store
+        sessions.delete(sid)
+      }
+    },
+
     "session.deleted": async (event: any) => {
       const sid = event.sessionID
       if (sid) sessions.delete(sid)
