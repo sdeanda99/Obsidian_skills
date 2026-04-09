@@ -11,6 +11,103 @@ search capabilities.
 - **Omnisearch Custom Tool** — Fast, fuzzy vault search with result excerpts
 - **Obsidian CLI Tool** — Typed TypeScript wrapper for vault CRUD, properties, tasks, and links
 
+## obsidian_note_logger Plugin
+
+Automatically captures Decisions and Patterns from your OpenCode sessions into Obsidian.
+After every substantive session (filtered by threshold + LLM classification), a structured
+note is written to your vault following the `obsidian-dev-notes` schema.
+
+### How It Works
+
+1. The plugin accumulates all tool calls and messages during a session
+2. Only context since the last Obsidian vault interaction is sent to the LLM (delta capture)
+3. When the agent goes idle (`session.idle`), it checks if the session was substantive
+   (configurable threshold: min tool calls + min messages)
+4. A lightweight LLM call classifies whether a Decision or Pattern is worth capturing
+   and extracts the project name and key topics
+5. Omnisearch is queried for related existing notes — if found, the LLM decides whether
+   to enrich an existing note or create a new one (dedup check)
+6. The note is written to your Obsidian vault via the CLI, and linked into your project MOC
+7. A toast notification confirms the write; transactions are logged to `wiki/log.md`
+
+### Installation
+
+The plugin is already in `.opencode/plugins/obsidian_note_logger.ts`.
+Install the `openai` Python dependency:
+
+```bash
+pip install openai>=1.0.0
+# or
+uv pip install openai>=1.0.0
+```
+
+Then configure the model in `opencode.json` (see examples below).
+
+### Configuration Examples
+
+**Default — inherits the same model as your main OpenCode session:**
+
+```jsonc
+"obsidian_note_logger": {
+  "model": null,
+  "base_url": null,
+  "api_key": null
+}
+```
+
+**Local AI with Ollama (no API costs, fully private):**
+
+```jsonc
+"obsidian_note_logger": {
+  "model": "llama3.2",
+  "base_url": "http://localhost:11434/v1",
+  "api_key": "ollama"
+}
+```
+
+Requires Ollama running locally: `ollama serve` and `ollama pull llama3.2`.
+
+**Smaller cloud model — Anthropic Haiku (fast and cheap):**
+
+```jsonc
+"obsidian_note_logger": {
+  "model": "claude-haiku-4-5",
+  "base_url": null,
+  "api_key": null
+}
+```
+
+Uses `ANTHROPIC_API_KEY` from your environment automatically.
+
+### Full Config Reference
+
+```jsonc
+"obsidian_note_logger": {
+  // LLM config
+  "model": null,           // null = inherit OPENCODE_MODEL env → fallback claude-haiku-4-5
+  "base_url": null,        // null = cloud; "http://localhost:11434/v1" = Ollama
+  "api_key": null,         // null = inherit ANTHROPIC_API_KEY / OPENAI_API_KEY from env
+
+  // Vault
+  "vault": null,           // null = active vault; "My Vault" = specific vault name
+  "note_skill": "obsidian-dev-notes",  // skill schema governing note structure
+
+  // Filtering (sessions below these thresholds are silently ignored)
+  "min_tool_calls": 2,
+  "min_messages": 3,
+
+  // Transaction log
+  "log_path": "wiki/log.md",   // vault-relative path
+  "log_enabled": true,
+
+  // Notifications
+  "toast_enabled": true,        // in-app TUI toast
+  "os_notify": false            // OS-level notify-send / osascript
+}
+```
+
+---
+
 ## Prerequisites
 
 ### Required Software
