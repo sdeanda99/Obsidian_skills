@@ -62,7 +62,7 @@ function loadConfig(project: Record<string, unknown>): NoteLoggerConfig {
 
 // ── Plugin export ──────────────────────────────────────────────────────────
 
-export default async function ({ project, client, worktree }: PluginInput) {
+export default async function ({ project, client, worktree, $ }: PluginInput) {
   const config = loadConfig(project)
   const sessions = new Map<string, SessionData>()
   const SCRIPT = resolve(import.meta.dir, "../tools/obsidian_note_writer.py")
@@ -170,7 +170,7 @@ export default async function ({ project, client, worktree }: PluginInput) {
 
         // Shell out to Python worker
         try {
-          const result = await Bun.$`python3 ${SCRIPT} ${transcriptPath} ${configPath} ${worktree}`.text()
+          const result = await $`python3 ${SCRIPT} ${transcriptPath} ${configPath} ${worktree}`.text()
           const parsed = JSON.parse(result.trim())
 
           if (parsed.status === "written" && config.toast_enabled) {
