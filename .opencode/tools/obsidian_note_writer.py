@@ -539,10 +539,11 @@ if __name__ == "__main__":
             ),
         )
         print(json.dumps({"status": "skipped", "reason": classification.reasoning}))
-        try:
-            Path(transcript_path).unlink()
-        except Exception:
-            pass
+        for tmp in [transcript_path, config_path]:
+            try:
+                Path(tmp).unlink()
+            except Exception:
+                pass
         sys.exit(0)
 
     # --- Pre-Write Search (dedup check) ---
