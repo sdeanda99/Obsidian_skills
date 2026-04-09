@@ -3,3 +3,4 @@
 # Or use uv: uv pip install -e .
 
 PyYAML>=6.0
+openai>=1.0.0
