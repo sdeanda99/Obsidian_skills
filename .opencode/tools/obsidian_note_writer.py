@@ -18,6 +18,12 @@ import urllib.request
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
+from openai import BadRequestError
+
+
+def encode_content(s: str) -> str:
+    """Encode newlines and tabs for Obsidian CLI content= arguments."""
+    return s.replace("\n", "\\n").replace("\t", "\\t")
 
 
 def load_config(config_path: str) -> dict:
@@ -65,9 +71,9 @@ def load_transcript(transcript_path: str) -> dict:
     """Load and validate the SessionData JSON from the plugin."""
     with open(transcript_path) as f:
         data = json.load(f)
-    assert "sessionID" in data, "Missing sessionID"
-    assert "toolCalls" in data, "Missing toolCalls"
-    assert "messages" in data, "Missing messages"
+    for field in ("sessionID", "toolCalls", "messages"):
+        if field not in data:
+            raise ValueError(f"Missing required field: {field}")
     return data
 
 
@@ -193,7 +199,8 @@ Do not capture if: the session is exploratory, trivial, or contains no clear out
             temperature=0,
         )
         data = json.loads(response.choices[0].message.content)
-    except Exception:
+    except BadRequestError:
+        # Provider doesn't support json_object mode — retry in text mode
         response = client.chat.completions.create(
             model=model,
             messages=[
@@ -349,7 +356,8 @@ Rules:
             temperature=0.3,
         )
         data = json.loads(response.choices[0].message.content)
-    except Exception:
+    except BadRequestError:
+        # Provider doesn't support json_object mode — retry in text mode
         response = client.chat.completions.create(
             model=model,
             messages=[
@@ -378,17 +386,6 @@ Rules:
         f"LLM response missing required keys: {list(data.keys())}"
     )
     return data
-
-
-def write_note(path: str, content: str, vault: str | None) -> tuple[bool, str]:
-    """Write a note to Obsidian via CLI. Returns (success, error_message)."""
-    code, stdout, stderr = obsidian_run(
-        ["create", f"path={path}", f"content={content}", "overwrite=false"],
-        vault=vault,
-    )
-    if code != 0:
-        return False, stderr or stdout or "Unknown CLI error"
-    return True, ""
 
 
 def insert_moc_link(
@@ -446,7 +443,12 @@ def insert_moc_link(
 
     new_content = "\n".join(lines)
     code, _, stderr = obsidian_run(
-        ["create", f"path={moc_path}", f"content={new_content}", "overwrite=true"],
+        [
+            "create",
+            f"path={moc_path}",
+            f"content={encode_content(new_content)}",
+            "overwrite=true",
+        ],
         vault=vault,
     )
     if code != 0:
@@ -461,7 +463,10 @@ def append_log(config: dict, vault: str | None, entry: str) -> None:
     log_path = config.get("log_path", "wiki/log.md")
     content = f"\n{entry}\n"
     try:
-        obsidian_run(["append", f"path={log_path}", f"content={content}"], vault=vault)
+        obsidian_run(
+            ["append", f"path={log_path}", f"content={encode_content(content)}"],
+            vault=vault,
+        )
     except Exception:
         pass
 
@@ -476,7 +481,9 @@ def os_notify(config: dict, title: str, message: str) -> None:
         if platform.system() == "Linux":
             subprocess.run(["notify-send", title, message], timeout=5)
         elif platform.system() == "Darwin":
-            script = f'display notification "{message}" with title "{title}"'
+            safe_msg = message.replace('"', '\\"')
+            safe_title = title.replace('"', '\\"')
+            script = f'display notification "{safe_msg}" with title "{safe_title}"'
             subprocess.run(["osascript", "-e", script], timeout=5)
     except Exception:
         pass
@@ -568,7 +575,7 @@ if __name__ == "__main__":
         note = generate_note(
             client, model, transcript_text, skill_prompt, classification, existing_notes
         )
-    except (ValueError, AssertionError, Exception) as e:
+    except Exception as e:
         print(f"Note generation failed: {e}", file=sys.stderr)
         append_log(
             config,
@@ -600,17 +607,19 @@ if __name__ == "__main__":
     write_args = [
         "create",
         f"path={write_path}",
-        f"content={note_content}",
+        f"content={encode_content(note_content)}",
         overwrite_flag,
     ]
     code, stdout, stderr = obsidian_run(write_args, vault=vault)
+    err = ""
+    write_failed = False
     if code != 0:
         err = stderr or stdout or "Unknown CLI error"
         if action == "enrich":
             write_args2 = [
                 "create",
                 f"path={note_path}",
-                f"content={note_content}",
+                f"content={encode_content(note_content)}",
                 "overwrite=false",
             ]
             code2, _, _ = obsidian_run(write_args2, vault=vault)
@@ -620,31 +629,23 @@ if __name__ == "__main__":
                 )
                 write_path = note_path
             else:
-                print(f"Obsidian write failed: {err}", file=sys.stderr)
-                append_log(
-                    config,
-                    vault,
-                    (
-                        f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — ERROR: write failed\n"
-                        f"- **Session:** {session_id}\n"
-                        f"- **Error:** obsidian CLI returned non-zero exit code\n"
-                        f"- **Raw:** {err}"
-                    ),
-                )
-                sys.exit(1)
+                write_failed = True
         else:
-            print(f"Obsidian write failed: {err}", file=sys.stderr)
-            append_log(
-                config,
-                vault,
-                (
-                    f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — ERROR: write failed\n"
-                    f"- **Session:** {session_id}\n"
-                    f"- **Error:** obsidian CLI returned non-zero exit code\n"
-                    f"- **Raw:** {err}"
-                ),
-            )
-            sys.exit(1)
+            write_failed = True
+
+    if write_failed:
+        print(f"Obsidian write failed: {err}", file=sys.stderr)
+        append_log(
+            config,
+            vault,
+            (
+                f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — ERROR: write failed\n"
+                f"- **Session:** {session_id}\n"
+                f"- **Error:** obsidian CLI returned non-zero exit code\n"
+                f"- **Raw:** {err}"
+            ),
+        )
+        sys.exit(1)
 
     # --- MOC insert (best-effort) ---
     moc_ok, moc_warn = insert_moc_link(write_path, note_type, vault)
@@ -676,7 +677,7 @@ if __name__ == "__main__":
     )
 
     # --- OS notification ---
-    os_notify(config, "OpenCode → Obsidian", f"Note written: {note_path}")
+    os_notify(config, "OpenCode → Obsidian", f"Note written: {write_path}")
 
     # --- Clean up temp files ---
     for tmp in [transcript_path, config_path]:
