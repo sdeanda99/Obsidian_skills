@@ -84,6 +84,63 @@ export default async function ({ project, client, worktree }: PluginContext) {
   })
 
   return {
-    // hooks added in Tasks 10 and 11
+    "tool.execute.after": async (event: any) => {
+      const sid = event.sessionID
+      if (!sid) return
+      if (!sessions.has(sid)) {
+        sessions.set(sid, {
+          sessionID: sid,
+          toolCalls: [],
+          messages: [],
+          startedAt: new Date().toISOString(),
+          lastObsidianWriteAt: null,
+        })
+      }
+      const s = sessions.get(sid)!
+      const toolName = event.tool ?? "unknown"
+      const now = new Date().toISOString()
+      s.toolCalls.push({
+        tool: toolName,
+        input: event.input ?? {},
+        output: event.output ?? "",
+        timestamp: now,
+      })
+      // Delta capture: track last Obsidian vault touch (Option B)
+      if (OBSIDIAN_TOOLS.has(toolName)) {
+        s.lastObsidianWriteAt = now
+      }
+    },
+
+    "message.updated": async (event: any) => {
+      const sid = event.sessionID
+      if (!sid) return
+      if (!sessions.has(sid)) {
+        sessions.set(sid, {
+          sessionID: sid,
+          toolCalls: [],
+          messages: [],
+          startedAt: new Date().toISOString(),
+          lastObsidianWriteAt: null,
+        })
+      }
+      const s = sessions.get(sid)!
+      const msgID = event.messageID ?? event.id ?? `msg-${Date.now()}`
+      const content = typeof event.content === "string"
+        ? event.content
+        : (event.content?.text ?? event.content?.value ?? "")
+      const role = event.role ?? "assistant"
+      // Upsert by message ID (handles streaming — last write wins)
+      const existing = s.messages.findIndex((m) => m.id === msgID)
+      if (existing >= 0) {
+        s.messages[existing] = { id: msgID, role, content, timestamp: new Date().toISOString() }
+      } else {
+        s.messages.push({ id: msgID, role, content, timestamp: new Date().toISOString() })
+      }
+    },
+
+    "session.deleted": async (event: any) => {
+      const sid = event.sessionID
+      if (sid) sessions.delete(sid)
+    },
   }
 }
