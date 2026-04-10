@@ -16,6 +16,7 @@ import subprocess
 import datetime
 import urllib.request
 import urllib.parse
+import socket as _socket
 from dataclasses import dataclass
 from pathlib import Path
 from openai import BadRequestError
@@ -24,6 +25,257 @@ from openai import BadRequestError
 def encode_content(s: str) -> str:
     """Encode newlines and tabs for Obsidian CLI content= arguments."""
     return s.replace("\n", "\\n").replace("\t", "\\t")
+
+
+class ObsidianClient:
+    """
+    Three-layer Obsidian write client.
+    Tries: (1) IPC socket, (2) Local REST API, (3) direct filesystem.
+    All public methods return (success: bool, output: str, error: str).
+    """
+
+    def __init__(self, vault_name: str | None, config: dict):
+        self.vault_name = vault_name
+        self._sock_path = self._find_sock_path()
+        self._vault_path = self._find_vault_path(vault_name)
+        self._rest_key, self._rest_port = self._find_rest_config(vault_name)
+
+    # ── Backend detection ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _find_sock_path() -> str | None:
+        """Return IPC socket path for current user, or None if not found."""
+        xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+        candidate = os.path.join(xdg, ".obsidian-cli.sock")
+        if os.path.exists(candidate):
+            return candidate
+        home_candidate = os.path.join(os.path.expanduser("~"), ".obsidian-cli.sock")
+        if os.path.exists(home_candidate):
+            return home_candidate
+        return None
+
+    @staticmethod
+    def _find_vault_path(vault_name: str | None) -> Path | None:
+        """
+        Resolve vault filesystem path from ~/.config/obsidian/obsidian.json.
+        Matches by vault name (directory name). Returns None if not found.
+        """
+        try:
+            config_path = Path.home() / ".config" / "obsidian" / "obsidian.json"
+            data = json.loads(config_path.read_text())
+            for vault in data.get("vaults", {}).values():
+                p = Path(vault["path"])
+                if vault_name is None or p.name == vault_name:
+                    return p
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _find_rest_config(vault_name: str | None) -> tuple[str | None, int]:
+        """
+        Auto-detect Local REST API key and port from vault plugin data.json.
+        Returns (api_key, port). Falls back to (None, 27123).
+        """
+        DEFAULT_PORT = 27123
+        try:
+            config_path = Path.home() / ".config" / "obsidian" / "obsidian.json"
+            data = json.loads(config_path.read_text())
+            for vault in data.get("vaults", {}).values():
+                p = Path(vault["path"])
+                if vault_name is None or p.name == vault_name:
+                    plugin_data = (
+                        p
+                        / ".obsidian"
+                        / "plugins"
+                        / "obsidian-local-rest-api"
+                        / "data.json"
+                    )
+                    if plugin_data.exists():
+                        pdata = json.loads(plugin_data.read_text())
+                        key = pdata.get("apiKey")
+                        port = pdata.get("insecurePort", DEFAULT_PORT)
+                        return key, port
+        except Exception:
+            pass
+        return None, DEFAULT_PORT
+
+    # ── IPC layer ──────────────────────────────────────────────────────────
+
+    def _ipc(self, args: list[str]) -> tuple[bool, str, str]:
+        """
+        Send a command via Obsidian IPC socket.
+        Protocol: JSON {"argv": [...], "tty": false, "cwd": "/tmp"} + "\\ndTmIPC\\n"
+        vault prefix prepended automatically if vault_name is set.
+        Returns (success, stdout, stderr).
+        """
+        if not self._sock_path:
+            return False, "", "IPC socket not found"
+        argv = []
+        if self.vault_name:
+            argv.append(f"vault={self.vault_name}")
+        argv.extend(args)
+        payload = json.dumps({"argv": argv, "tty": False, "cwd": "/tmp"}) + "\ndTmIPC\n"
+        try:
+            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect(self._sock_path)
+            sock.send(payload.encode())
+            import time
+
+            time.sleep(0.5)
+            chunks = []
+            while True:
+                try:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                except _socket.timeout:
+                    break
+            sock.close()
+            output = b"".join(chunks).decode(errors="replace").strip()
+            # IPC errors come back as text starting with "Error:" or similar
+            if output.lower().startswith("error"):
+                return False, "", output
+            return True, output, ""
+        except Exception as e:
+            return False, "", str(e)
+
+    # ── REST API layer ─────────────────────────────────────────────────────
+
+    def _rest_read(self, path: str) -> tuple[bool, str, str]:
+        if not self._rest_key:
+            return False, "", "REST API key not available"
+        url = f"http://localhost:{self._rest_port}/vault/{urllib.parse.quote(path)}"
+        req = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {self._rest_key}"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return True, r.read().decode(), ""
+        except Exception as e:
+            return False, "", str(e)
+
+    def _rest_put(self, path: str, content: str) -> tuple[bool, str, str]:
+        if not self._rest_key:
+            return False, "", "REST API key not available"
+        url = f"http://localhost:{self._rest_port}/vault/{urllib.parse.quote(path)}"
+        data = content.encode()
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="PUT",
+            headers={
+                "Authorization": f"Bearer {self._rest_key}",
+                "Content-Type": "text/markdown",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return True, str(r.status), ""
+        except Exception as e:
+            return False, "", str(e)
+
+    def _rest_append(self, path: str, content: str) -> tuple[bool, str, str]:
+        if not self._rest_key:
+            return False, "", "REST API key not available"
+        url = f"http://localhost:{self._rest_port}/vault/{urllib.parse.quote(path)}"
+        data = content.encode()
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="PATCH",
+            headers={
+                "Authorization": f"Bearer {self._rest_key}",
+                "Content-Type": "text/markdown",
+                "Target-Type": "end-of-file",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return True, str(r.status), ""
+        except Exception as e:
+            return False, "", str(e)
+
+    # ── Filesystem layer ───────────────────────────────────────────────────
+
+    def _fs_read(self, path: str) -> tuple[bool, str, str]:
+        if not self._vault_path:
+            return False, "", "vault path unknown"
+        try:
+            return True, (self._vault_path / path).read_text(), ""
+        except Exception as e:
+            return False, "", str(e)
+
+    def _fs_write(
+        self, path: str, content: str, overwrite: bool
+    ) -> tuple[bool, str, str]:
+        if not self._vault_path:
+            return False, "", "vault path unknown"
+        try:
+            full = self._vault_path / path
+            if full.exists() and not overwrite:
+                return False, "", f"File exists and overwrite=False: {path}"
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text(content)
+            return True, f"Written: {path}", ""
+        except Exception as e:
+            return False, "", str(e)
+
+    def _fs_append(self, path: str, content: str) -> tuple[bool, str, str]:
+        if not self._vault_path:
+            return False, "", "vault path unknown"
+        try:
+            full = self._vault_path / path
+            full.parent.mkdir(parents=True, exist_ok=True)
+            with open(full, "a") as f:
+                f.write(content)
+            return True, f"Appended: {path}", ""
+        except Exception as e:
+            return False, "", str(e)
+
+    # ── Public API (three-layer with fallback) ─────────────────────────────
+
+    def read(self, path: str) -> tuple[bool, str, str]:
+        """Read a note. Tries IPC → REST → filesystem."""
+        ok, out, err = self._ipc(["read", f"path={path}"])
+        if ok and out:
+            return True, out, ""
+        if self._rest_key:
+            ok, out, err2 = self._rest_read(path)
+            if ok:
+                return True, out, ""
+        return self._fs_read(path)
+
+    def create(
+        self, path: str, content: str, overwrite: bool = False
+    ) -> tuple[bool, str, str]:
+        """Create or overwrite a note. Tries IPC → REST → filesystem."""
+        ipc_args = ["create", f"path={path}", f"content={encode_content(content)}"]
+        if overwrite:
+            ipc_args.append("overwrite")
+        ok, out, err = self._ipc(ipc_args)
+        if ok:
+            return True, out, ""
+        if self._rest_key:
+            ok, out, err2 = self._rest_put(path, content)
+            if ok:
+                return True, out, ""
+        return self._fs_write(path, content, overwrite)
+
+    def append(self, path: str, content: str) -> tuple[bool, str, str]:
+        """Append content to a note. Tries IPC → REST → filesystem."""
+        ok, out, err = self._ipc(
+            ["append", f"path={path}", f"content={encode_content(content)}"]
+        )
+        if ok:
+            return True, out, ""
+        if self._rest_key:
+            ok, out, err2 = self._rest_append(path, content)
+            if ok:
+                return True, out, ""
+        return self._fs_append(path, content)
 
 
 def load_config(config_path: str) -> dict:
@@ -226,24 +478,11 @@ Do not capture if: the session is exploratory, trivial, or contains no clear out
     )
 
 
-def obsidian_run(args: list[str], vault: str | None = None) -> tuple[int, str, str]:
-    """
-    Run an obsidian CLI command. Returns (exit_code, stdout, stderr).
-    vault is prepended as vault=<name> if provided.
-    """
-    cmd = ["obsidian"]
-    if vault:
-        cmd.append(f"vault={vault}")
-    cmd.extend(args)
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    return result.returncode, result.stdout.strip(), result.stderr.strip()
-
-
 def search_related_notes(
     project: str,
     topics: list,
     note_type: str,
-    vault: str | None,
+    client: ObsidianClient,
     score_threshold: int = 15,
 ) -> list:
     """
@@ -274,8 +513,8 @@ def search_related_notes(
     related = []
     for match in matches[:2]:
         path = match["path"]
-        code, content, _ = obsidian_run(["read", f"path={path}"], vault=vault)
-        if code == 0 and content:
+        ok, content, _ = client.read(path)
+        if ok and content:
             related.append({"path": path, "content": content})
 
     return related
@@ -389,15 +628,15 @@ Rules:
 
 
 def insert_moc_link(
-    note_path: str, note_type: str, vault: str | None
+    note_path: str, note_type: str, client: ObsidianClient
 ) -> tuple[bool, str]:
     """
     Insert a wikilink to the note into the project MOC under the appropriate heading.
     Returns (success, warning_or_error).
     """
-    code, content, stderr = obsidian_run(["read", f"path={note_path}"], vault=vault)
-    if code != 0:
-        return False, f"Could not read newly created note: {stderr}"
+    ok, content, err = client.read(note_path)
+    if not ok:
+        return False, f"Could not read newly created note: {err}"
 
     project = None
     for line in content.splitlines():
@@ -411,8 +650,8 @@ def insert_moc_link(
         )
 
     moc_path = f"Projects/{project}.md"
-    code, moc_content, _ = obsidian_run(["read", f"path={moc_path}"], vault=vault)
-    if code != 0:
+    ok, moc_content, _ = client.read(moc_path)
+    if not ok:
         return (
             False,
             f"MOC not found at {moc_path} — skipping MOC insert (note was still created)",
@@ -442,31 +681,20 @@ def insert_moc_link(
         lines.insert(insert_idx, wikilink)
 
     new_content = "\n".join(lines)
-    code, _, stderr = obsidian_run(
-        [
-            "create",
-            f"path={moc_path}",
-            f"content={encode_content(new_content)}",
-            "overwrite=true",
-        ],
-        vault=vault,
-    )
-    if code != 0:
-        return False, f"Failed to update MOC: {stderr}"
+    ok, _, err = client.create(moc_path, new_content, overwrite=True)
+    if not ok:
+        return False, f"Failed to update MOC: {err}"
     return True, ""
 
 
-def append_log(config: dict, vault: str | None, entry: str) -> None:
+def append_log(config: dict, client: ObsidianClient, entry: str) -> None:
     """Append an entry to wiki/log.md in the vault. Silently ignores failures."""
     if not config.get("log_enabled", True):
         return
     log_path = config.get("log_path", "wiki/log.md")
     content = f"\n{entry}\n"
     try:
-        obsidian_run(
-            ["append", f"path={log_path}", f"content={encode_content(content)}"],
-            vault=vault,
-        )
+        client.append(log_path, content)
     except Exception:
         pass
 
@@ -514,6 +742,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     vault = config.get("vault") or None
+    obsidian = ObsidianClient(vault, config)
     model = resolve_model(config)
     worktree = sys.argv[3] if len(sys.argv) > 3 else os.getcwd()
     skill_prompt = load_skill_prompt(config, worktree)
@@ -538,7 +767,7 @@ if __name__ == "__main__":
     if not classification.should_capture:
         append_log(
             config,
-            vault,
+            obsidian,
             (
                 f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — Skipped (not a decision/pattern)\n"
                 f"- **Session:** {session_id}\n"
@@ -560,7 +789,7 @@ if __name__ == "__main__":
             classification.project,
             classification.topics,
             classification.note_type,
-            vault,
+            obsidian,
         )
         if existing_notes:
             dedup_label = f"Found {len(existing_notes)} related"
@@ -579,7 +808,7 @@ if __name__ == "__main__":
         print(f"Note generation failed: {e}", file=sys.stderr)
         append_log(
             config,
-            vault,
+            obsidian,
             (
                 f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — ERROR: note generation failed\n"
                 f"- **Session:** {session_id}\n"
@@ -596,34 +825,21 @@ if __name__ == "__main__":
 
     # --- Write note to Obsidian (create or enrich) ---
     if action == "enrich" and existing_path:
-        overwrite_flag = "overwrite=true"
         write_path = existing_path
         action_label = f"Enriched {existing_path}"
     else:
-        overwrite_flag = "overwrite=false"
         write_path = note_path
         action_label = "Created"
 
-    write_args = [
-        "create",
-        f"path={write_path}",
-        f"content={encode_content(note_content)}",
-        overwrite_flag,
-    ]
-    code, stdout, stderr = obsidian_run(write_args, vault=vault)
-    err = ""
     write_failed = False
-    if code != 0:
-        err = stderr or stdout or "Unknown CLI error"
+    err = ""
+    ok, _, err = obsidian.create(
+        write_path, note_content, overwrite=(action == "enrich")
+    )
+    if not ok:
         if action == "enrich":
-            write_args2 = [
-                "create",
-                f"path={note_path}",
-                f"content={encode_content(note_content)}",
-                "overwrite=false",
-            ]
-            code2, _, _ = obsidian_run(write_args2, vault=vault)
-            if code2 == 0:
+            ok2, _, _ = obsidian.create(note_path, note_content, overwrite=False)
+            if ok2:
                 action_label = (
                     f"Created (enrich fallback — original write failed: {err})"
                 )
@@ -637,18 +853,18 @@ if __name__ == "__main__":
         print(f"Obsidian write failed: {err}", file=sys.stderr)
         append_log(
             config,
-            vault,
+            obsidian,
             (
                 f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — ERROR: write failed\n"
                 f"- **Session:** {session_id}\n"
-                f"- **Error:** obsidian CLI returned non-zero exit code\n"
+                f"- **Error:** obsidian write returned failure\n"
                 f"- **Raw:** {err}"
             ),
         )
         sys.exit(1)
 
     # --- MOC insert (best-effort) ---
-    moc_ok, moc_warn = insert_moc_link(write_path, note_type, vault)
+    moc_ok, moc_warn = insert_moc_link(write_path, note_type, obsidian)
     moc_note = f"\n- **MOC warning:** {moc_warn}" if not moc_ok else ""
 
     # --- Transaction log ---
@@ -660,7 +876,7 @@ if __name__ == "__main__":
     provider_label = "ollama" if "11434" in base_url else base_url
     append_log(
         config,
-        vault,
+        obsidian,
         (
             f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — {note_type.capitalize()} captured\n"
             f"- **Session:** {session_id}\n"
