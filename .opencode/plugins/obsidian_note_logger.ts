@@ -1,6 +1,6 @@
-import type { PluginInput, PluginOptions } from "@opencode-ai/plugin"
+import type { PluginInput } from "@opencode-ai/plugin"
 import { resolve } from "path"
-import { writeFileSync, unlinkSync } from "fs"
+import { writeFileSync, unlinkSync, readFileSync } from "fs"
 import { tmpdir } from "os"
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -42,11 +42,28 @@ interface NoteLoggerConfig {
 }
 
 // ── Config loader ──────────────────────────────────────────────────────────
+// OpenCode does NOT pass plugin tuple options to local file plugins (options arg is always {}).
+// Read config directly from opencode.json in the project directory instead.
 
-function loadConfig(options: Record<string, unknown>): NoteLoggerConfig {
-  // Options from the plugin tuple [path, {"obsidian_note_logger": {...}}]
-  // arrive here as the top-level options object.
-  const raw = (options["obsidian_note_logger"] ?? {}) as Partial<NoteLoggerConfig>
+function loadConfig(directory: string): NoteLoggerConfig {
+  let raw: Partial<NoteLoggerConfig> = {}
+  try {
+    const configPath = resolve(directory, "opencode.json")
+    const json = JSON.parse(readFileSync(configPath, "utf8"))
+    // Find our plugin tuple: ["path", { obsidian_note_logger: {...} }]
+    const plugins: unknown[] = json.plugin ?? []
+    for (const entry of plugins) {
+      if (Array.isArray(entry) && entry.length >= 2) {
+        const pluginOptions = entry[1] as Record<string, unknown>
+        if (pluginOptions.obsidian_note_logger) {
+          raw = pluginOptions.obsidian_note_logger as Partial<NoteLoggerConfig>
+          break
+        }
+      }
+    }
+  } catch {
+    // No config file or parse error — use all defaults
+  }
   return {
     model: raw.model ?? null,
     base_url: raw.base_url ?? null,
@@ -78,14 +95,14 @@ function getOrCreate(sessions: Map<string, SessionData>, sid: string): SessionDa
 }
 
 // ── Plugin export ──────────────────────────────────────────────────────────
-// Use named export (not default) — matches the pattern OpenCode expects.
-// Options from the plugin tuple [path, options] arrive as the second argument.
+// Named export — matches the pattern all working OpenCode plugins use.
+// Config is read directly from opencode.json because OpenCode does NOT pass
+// plugin tuple options to local file plugins (options arg is always {}).
 
 export const ObsidianNoteLoggerPlugin = async (
-  { client, worktree, $ }: PluginInput,
-  options: PluginOptions = {},
+  { client, worktree, directory, $ }: PluginInput,
 ) => {
-  const config = loadConfig(options)
+  const config = loadConfig(directory)
   const sessions = new Map<string, SessionData>()
   const SCRIPT = resolve(import.meta.dir, "../tools/obsidian_note_writer.py")
 
