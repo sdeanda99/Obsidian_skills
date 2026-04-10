@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import datetime
+import time
 import urllib.request
 import urllib.parse
 import socket as _socket
@@ -36,11 +37,24 @@ class ObsidianClient:
 
     def __init__(self, vault_name: str | None, config: dict):
         self.vault_name = vault_name
+        self.config = config
         self._sock_path = self._find_sock_path()
-        self._vault_path = self._find_vault_path(vault_name)
-        self._rest_key, self._rest_port = self._find_rest_config(vault_name)
+        obsidian_cfg = self._read_obsidian_config()
+        self._vault_path = self._find_vault_path(vault_name, obsidian_cfg)
+        self._rest_key, self._rest_port = self._find_rest_config(
+            vault_name, obsidian_cfg
+        )
 
     # ── Backend detection ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _read_obsidian_config() -> dict:
+        """Read ~/.config/obsidian/obsidian.json. Returns empty dict on any error."""
+        try:
+            config_path = Path.home() / ".config" / "obsidian" / "obsidian.json"
+            return json.loads(config_path.read_text())
+        except Exception:
+            return {}
 
     @staticmethod
     def _find_sock_path() -> str | None:
@@ -55,15 +69,13 @@ class ObsidianClient:
         return None
 
     @staticmethod
-    def _find_vault_path(vault_name: str | None) -> Path | None:
+    def _find_vault_path(vault_name: str | None, obsidian_config: dict) -> Path | None:
         """
-        Resolve vault filesystem path from ~/.config/obsidian/obsidian.json.
+        Resolve vault filesystem path from the pre-loaded obsidian config.
         Matches by vault name (directory name). Returns None if not found.
         """
         try:
-            config_path = Path.home() / ".config" / "obsidian" / "obsidian.json"
-            data = json.loads(config_path.read_text())
-            for vault in data.get("vaults", {}).values():
+            for vault in obsidian_config.get("vaults", {}).values():
                 p = Path(vault["path"])
                 if vault_name is None or p.name == vault_name:
                     return p
@@ -72,16 +84,16 @@ class ObsidianClient:
         return None
 
     @staticmethod
-    def _find_rest_config(vault_name: str | None) -> tuple[str | None, int]:
+    def _find_rest_config(
+        vault_name: str | None, obsidian_config: dict
+    ) -> tuple[str | None, int]:
         """
         Auto-detect Local REST API key and port from vault plugin data.json.
         Returns (api_key, port). Falls back to (None, 27123).
         """
         DEFAULT_PORT = 27123
         try:
-            config_path = Path.home() / ".config" / "obsidian" / "obsidian.json"
-            data = json.loads(config_path.read_text())
-            for vault in data.get("vaults", {}).values():
+            for vault in obsidian_config.get("vaults", {}).values():
                 p = Path(vault["path"])
                 if vault_name is None or p.name == vault_name:
                     plugin_data = (
@@ -116,13 +128,12 @@ class ObsidianClient:
             argv.append(f"vault={self.vault_name}")
         argv.extend(args)
         payload = json.dumps({"argv": argv, "tty": False, "cwd": "/tmp"}) + "\ndTmIPC\n"
+        sock = None
         try:
             sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
             sock.settimeout(10)
             sock.connect(self._sock_path)
             sock.send(payload.encode())
-            import time
-
             time.sleep(0.5)
             chunks = []
             while True:
@@ -133,7 +144,6 @@ class ObsidianClient:
                     chunks.append(chunk)
                 except _socket.timeout:
                     break
-            sock.close()
             output = b"".join(chunks).decode(errors="replace").strip()
             # IPC errors come back as text starting with "Error:" or similar
             if output.lower().startswith("error"):
@@ -141,6 +151,9 @@ class ObsidianClient:
             return True, output, ""
         except Exception as e:
             return False, "", str(e)
+        finally:
+            if sock:
+                sock.close()
 
     # ── REST API layer ─────────────────────────────────────────────────────
 
@@ -180,16 +193,16 @@ class ObsidianClient:
     def _rest_append(self, path: str, content: str) -> tuple[bool, str, str]:
         if not self._rest_key:
             return False, "", "REST API key not available"
-        url = f"http://localhost:{self._rest_port}/vault/{urllib.parse.quote(path)}"
+        # POST /vault/{path}/ appends to end of file
+        url = f"http://localhost:{self._rest_port}/vault/{urllib.parse.quote(path)}/"
         data = content.encode()
         req = urllib.request.Request(
             url,
             data=data,
-            method="PATCH",
+            method="POST",
             headers={
                 "Authorization": f"Bearer {self._rest_key}",
                 "Content-Type": "text/markdown",
-                "Target-Type": "end-of-file",
             },
         )
         try:
@@ -239,43 +252,76 @@ class ObsidianClient:
 
     def read(self, path: str) -> tuple[bool, str, str]:
         """Read a note. Tries IPC → REST → filesystem."""
+        errors = []
         ok, out, err = self._ipc(["read", f"path={path}"])
+        if err:
+            errors.append(f"IPC: {err}")
+        # Fall through if output is empty — an empty IPC response may mean the file
+        # wasn't found or the command silently failed; try next backend.
         if ok and out:
             return True, out, ""
         if self._rest_key:
             ok, out, err2 = self._rest_read(path)
             if ok:
                 return True, out, ""
-        return self._fs_read(path)
+            if err2:
+                errors.append(f"REST: {err2}")
+        ok, out, err3 = self._fs_read(path)
+        if ok:
+            return True, out, ""
+        if err3:
+            errors.append(f"FS: {err3}")
+        return False, "", "; ".join(errors) if errors else "all backends failed"
 
     def create(
         self, path: str, content: str, overwrite: bool = False
     ) -> tuple[bool, str, str]:
-        """Create or overwrite a note. Tries IPC → REST → filesystem."""
+        """Create or overwrite a note. Tries IPC → REST (if overwrite=True) → filesystem."""
+        errors = []
         ipc_args = ["create", f"path={path}", f"content={encode_content(content)}"]
         if overwrite:
             ipc_args.append("overwrite")
         ok, out, err = self._ipc(ipc_args)
+        if err:
+            errors.append(f"IPC: {err}")
         if ok:
             return True, out, ""
-        if self._rest_key:
+        # REST PUT always overwrites — only use it when overwrite is explicitly True
+        if self._rest_key and overwrite:
             ok, out, err2 = self._rest_put(path, content)
             if ok:
                 return True, out, ""
-        return self._fs_write(path, content, overwrite)
+            if err2:
+                errors.append(f"REST: {err2}")
+        ok, out, err3 = self._fs_write(path, content, overwrite)
+        if ok:
+            return True, out, ""
+        if err3:
+            errors.append(f"FS: {err3}")
+        return False, "", "; ".join(errors) if errors else "all backends failed"
 
     def append(self, path: str, content: str) -> tuple[bool, str, str]:
         """Append content to a note. Tries IPC → REST → filesystem."""
+        errors = []
         ok, out, err = self._ipc(
             ["append", f"path={path}", f"content={encode_content(content)}"]
         )
+        if err:
+            errors.append(f"IPC: {err}")
         if ok:
             return True, out, ""
         if self._rest_key:
             ok, out, err2 = self._rest_append(path, content)
             if ok:
                 return True, out, ""
-        return self._fs_append(path, content)
+            if err2:
+                errors.append(f"REST: {err2}")
+        ok, out, err3 = self._fs_append(path, content)
+        if ok:
+            return True, out, ""
+        if err3:
+            errors.append(f"FS: {err3}")
+        return False, "", "; ".join(errors) if errors else "all backends failed"
 
 
 def load_config(config_path: str) -> dict:
