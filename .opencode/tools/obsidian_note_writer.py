@@ -330,59 +330,80 @@ def load_config(config_path: str) -> dict:
         return json.load(f)
 
 
-def resolve_model(config: dict) -> str:
-    """Resolve model name: config → OPENCODE_MODEL env → ANTHROPIC_DEFAULT_MODEL → fallback."""
+def resolve_api_key_and_base_url(config: dict) -> tuple[str, str]:
+    """
+    Resolve API key and base_url together from config → env vars → auth.json.
+
+    Priority:
+    1. Explicit config values (model, base_url, api_key)
+    2. Env vars (ANTHROPIC_API_KEY → Anthropic endpoint, OPENAI_API_KEY → no base_url)
+    3. OpenCode auth.json — prefers openrouter over anthropic because:
+       - Anthropic's sk-ant- keys are NOT accepted by their OpenAI-compat endpoint
+       - OpenRouter accepts its own keys and proxies to Anthropic correctly
+    4. Ollama fallback if base_url contains localhost:11434
+
+    Returns (api_key, base_url).
+    """
+    explicit_base = config.get("base_url") or ""
+    explicit_key = config.get("api_key") or ""
+
+    if explicit_key:
+        return explicit_key, explicit_base
+
+    if "localhost:11434" in explicit_base:
+        return "ollama", explicit_base
+
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return os.environ[
+            "ANTHROPIC_API_KEY"
+        ], explicit_base or "https://api.anthropic.com/v1/"
+    if os.environ.get("OPENAI_API_KEY"):
+        return os.environ["OPENAI_API_KEY"], explicit_base
+
+    # Read from OpenCode auth.json — prefer openrouter (works with OpenAI compat layer)
+    # over anthropic (sk-ant- keys are rejected by api.anthropic.com/v1/)
+    try:
+        auth_path = Path.home() / ".local" / "share" / "opencode" / "auth.json"
+        auth = json.loads(auth_path.read_text())
+        for provider in ("openrouter", "anthropic"):
+            if provider in auth and auth[provider].get("key"):
+                key = auth[provider]["key"]
+                if provider == "openrouter":
+                    return key, "https://openrouter.ai/api/v1/"
+                else:
+                    return key, "https://api.anthropic.com/v1/"
+        # First available key of any provider
+        for provider_data in auth.values():
+            if isinstance(provider_data, dict) and provider_data.get("key"):
+                return provider_data["key"], explicit_base
+    except Exception:
+        pass
+
+    return "", explicit_base
+
+
+def resolve_model(config: dict, base_url: str) -> str:
+    """
+    Resolve model name from config → env → fallback.
+    Adjusts default model name based on provider (OpenRouter uses namespaced models).
+    """
     if config.get("model"):
         return config["model"]
     if os.environ.get("OPENCODE_MODEL"):
         return os.environ["OPENCODE_MODEL"]
     if os.environ.get("ANTHROPIC_DEFAULT_MODEL"):
         return os.environ["ANTHROPIC_DEFAULT_MODEL"]
+    # OpenRouter requires provider-namespaced model names
+    if "openrouter" in base_url:
+        return "anthropic/claude-haiku-4-5"
     return "claude-haiku-4-5"
-
-
-def resolve_api_key(config: dict) -> str:
-    """Resolve API key: config → env vars → opencode auth.json → ollama fallback."""
-    if config.get("api_key"):
-        return config["api_key"]
-    base_url = config.get("base_url") or ""
-    if "localhost:11434" in base_url:
-        return "ollama"
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return os.environ["ANTHROPIC_API_KEY"]
-    if os.environ.get("OPENAI_API_KEY"):
-        return os.environ["OPENAI_API_KEY"]
-    # Fall back to OpenCode's own stored auth key
-    try:
-        auth_path = Path.home() / ".local" / "share" / "opencode" / "auth.json"
-        auth = json.loads(auth_path.read_text())
-        # Try anthropic first, then openrouter, then first available
-        for provider in ("anthropic", "openrouter"):
-            if provider in auth and auth[provider].get("key"):
-                return auth[provider]["key"]
-        for provider_data in auth.values():
-            if isinstance(provider_data, dict) and provider_data.get("key"):
-                return provider_data["key"]
-    except Exception:
-        pass
-    return ""
 
 
 def build_openai_client(config: dict):
     """Build an openai.OpenAI client from config."""
     from openai import OpenAI
 
-    api_key = resolve_api_key(config)
-    base_url = config.get("base_url") or ""
-
-    # Auto-detect provider from key prefix if no explicit base_url
-    if not base_url:
-        if api_key.startswith("sk-ant-"):
-            # Anthropic key — use their OpenAI-compatible endpoint
-            base_url = "https://api.anthropic.com/v1/"
-        # openrouter keys start with "sk-or-" — use their base URL
-        elif api_key.startswith("sk-or-"):
-            base_url = "https://openrouter.ai/api/v1/"
+    api_key, base_url = resolve_api_key_and_base_url(config)
 
     kwargs: dict = {"api_key": api_key}
     if base_url:
@@ -510,35 +531,22 @@ Capture if: the session contains an architectural decision, a technical trade-of
 or a reusable solution pattern worth preserving in a developer knowledge base.
 Do not capture if: the session is exploratory, trivial, or contains no clear outcome.
 """
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": f"Session transcript:\n\n{transcript}"},
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=200,
-            temperature=0,
-        )
-        data = json.loads(response.choices[0].message.content)
-    except BadRequestError:
-        # Provider doesn't support json_object mode — retry in text mode
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": f"Session transcript:\n\n{transcript}"},
-            ],
-            max_tokens=200,
-            temperature=0,
-        )
-        raw = response.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        data = json.loads(raw)
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Session transcript:\n\n{transcript}"},
+        ],
+        max_tokens=200,
+        temperature=0,
+    )
+    raw = response.choices[0].message.content.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.rsplit("```", 1)[0]
+    data = json.loads(raw.strip())
 
     return ClassifyResult(
         should_capture=bool(data.get("should_capture", False)),
@@ -828,7 +836,6 @@ if __name__ == "__main__":
 
     vault = config.get("vault") or None
     obsidian = ObsidianClient(vault, config)
-    model = resolve_model(config)
     worktree = sys.argv[3] if len(sys.argv) > 3 else os.getcwd()
     skill_prompt = load_skill_prompt(config, worktree)
     transcript_text = format_transcript(session)
@@ -836,6 +843,8 @@ if __name__ == "__main__":
 
     try:
         client = build_openai_client(config)
+        _, resolved_base_url = resolve_api_key_and_base_url(config)
+        model = resolve_model(config, resolved_base_url)
     except Exception as e:
         print(f"Failed to build LLM client: {e}", file=sys.stderr)
         sys.exit(1)
