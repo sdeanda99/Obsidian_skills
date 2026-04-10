@@ -605,6 +605,10 @@ def generate_note(
 
     Returns dict with keys: action, path, content, existing_path
     Raises ValueError/AssertionError if LLM output is not valid JSON or missing keys.
+
+    Uses a delimiter-based output format to avoid JSON escaping issues with
+    multiline Markdown content. The LLM outputs metadata as JSON, then the full
+    note content as plain text after a "---NOTE---" separator.
     """
     today = datetime.date.today().isoformat()
 
@@ -626,71 +630,81 @@ def generate_note(
 You are a developer knowledge base writer. Given an OpenCode session transcript,
 write or update a structured Obsidian note capturing the key {classification.note_type}.
 
-You MUST respond with a JSON object — no markdown fences:
+You MUST respond in exactly this format — two sections separated by the delimiter:
+
+SECTION 1: A JSON object on its own lines (no markdown fences):
 {{
-  "action": "create" or "enrich",
+  "action": "create",
   "path": "Decisions/YYYY-MM-DD-short-slug.md",
-  "content": "---\\ntype: {classification.note_type}\\nproject: {classification.project}\\n...\\n---\\n\\n## Context\\n...",
-  "existing_path": null or "Decisions/existing-note.md"
+  "existing_path": null
 }}
+
+SECTION 2: The literal string ---NOTE--- on its own line, followed by the complete note content.
+
+Example response:
+{{"action": "create", "path": "Decisions/{today}-example.md", "existing_path": null}}
+---NOTE---
+---
+type: {classification.note_type}
+project: {classification.project}
+...
+---
+
+## Context
+...
 
 Rules:
 - action "enrich": set existing_path to the path being updated, path = existing_path
 - action "create": set existing_path to null
 - path must start with Decisions/ or Patterns/ matching the note type
 - path filename (for create): YYYY-MM-DD-kebab-case-slug.md (today is {today})
-- content is the COMPLETE note after enrichment (not a diff — full replacement)
+- The note content after ---NOTE--- is the COMPLETE note (not a diff — full replacement)
 - frontmatter fields: type, project, status (decisions only), tags, created, updated
 - created and updated should be {today}
 - Use the schema from the skill instructions above for section headings
 - Be specific — extract actual content from the transcript, not generic summaries
 {existing_block}
 """
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Project: {classification.project}\n"
-                        f"Topics: {', '.join(classification.topics)}\n"
-                        f"Classification: {classification.reasoning}\n\n"
-                        f"Session transcript:\n\n{transcript}"
-                    ),
-                },
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=2000,
-            temperature=0.3,
-        )
-        data = json.loads(response.choices[0].message.content)
-    except BadRequestError:
-        # Provider doesn't support json_object mode — retry in text mode
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Project: {classification.project}\n"
-                        f"Topics: {', '.join(classification.topics)}\n"
-                        f"Classification: {classification.reasoning}\n\n"
-                        f"Session transcript:\n\n{transcript}"
-                    ),
-                },
-            ],
-            max_tokens=2000,
-            temperature=0.3,
-        )
-        raw = response.choices[0].message.content.strip()
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": (
+                    f"Project: {classification.project}\n"
+                    f"Topics: {', '.join(classification.topics)}\n"
+                    f"Classification: {classification.reasoning}\n\n"
+                    f"Session transcript:\n\n{transcript}"
+                ),
+            },
+        ],
+        max_tokens=2000,
+        temperature=0.3,
+    )
+    raw = response.choices[0].message.content.strip()
+
+    # Parse delimiter-based format: JSON metadata + ---NOTE--- + note content
+    DELIMITER = "---NOTE---"
+    if DELIMITER in raw:
+        meta_part, note_content = raw.split(DELIMITER, 1)
+        note_content = note_content.strip()
+        # Strip markdown fences from meta part if present
+        meta_part = meta_part.strip()
+        if meta_part.startswith("```"):
+            meta_part = meta_part.split("```")[1]
+            if meta_part.startswith("json"):
+                meta_part = meta_part[4:]
+        data = json.loads(meta_part.strip())
+        data["content"] = note_content
+    else:
+        # Fallback: try to parse the whole thing as JSON (legacy path)
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
-        data = json.loads(raw)
+            raw = raw.rsplit("```", 1)[0]
+        data = json.loads(raw.strip())
 
     assert "action" in data and "path" in data and "content" in data, (
         f"LLM response missing required keys: {list(data.keys())}"
