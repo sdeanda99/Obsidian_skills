@@ -177,8 +177,15 @@ export const ObsidianNoteLoggerPlugin = async (
       }
 
       try {
-        const result = await $`python3 ${SCRIPT} ${transcriptPath} ${configPath} ${worktree}`.text()
-        const parsed = JSON.parse(result.trim())
+        const proc = await $`python3 ${SCRIPT} ${transcriptPath} ${configPath} ${worktree}`.nothrow()
+        const stdout = proc.stdout.toString().trim()
+        const stderr = proc.stderr.toString().trim()
+
+        if (proc.exitCode !== 0) {
+          throw new Error(`exit ${proc.exitCode}: ${stderr || stdout}`)
+        }
+
+        const parsed = JSON.parse(stdout)
 
         if (parsed.status === "written" && config.toast_enabled) {
           await client.tui.showToast({
