@@ -342,7 +342,7 @@ def resolve_model(config: dict) -> str:
 
 
 def resolve_api_key(config: dict) -> str:
-    """Resolve API key: config → ANTHROPIC_API_KEY → OPENAI_API_KEY → ollama fallback."""
+    """Resolve API key: config → env vars → opencode auth.json → ollama fallback."""
     if config.get("api_key"):
         return config["api_key"]
     base_url = config.get("base_url") or ""
@@ -352,6 +352,19 @@ def resolve_api_key(config: dict) -> str:
         return os.environ["ANTHROPIC_API_KEY"]
     if os.environ.get("OPENAI_API_KEY"):
         return os.environ["OPENAI_API_KEY"]
+    # Fall back to OpenCode's own stored auth key
+    try:
+        auth_path = Path.home() / ".local" / "share" / "opencode" / "auth.json"
+        auth = json.loads(auth_path.read_text())
+        # Try anthropic first, then openrouter, then first available
+        for provider in ("anthropic", "openrouter"):
+            if provider in auth and auth[provider].get("key"):
+                return auth[provider]["key"]
+        for provider_data in auth.values():
+            if isinstance(provider_data, dict) and provider_data.get("key"):
+                return provider_data["key"]
+    except Exception:
+        pass
     return ""
 
 
@@ -359,9 +372,21 @@ def build_openai_client(config: dict):
     """Build an openai.OpenAI client from config."""
     from openai import OpenAI
 
-    kwargs = {"api_key": resolve_api_key(config)}
-    if config.get("base_url"):
-        kwargs["base_url"] = config["base_url"]
+    api_key = resolve_api_key(config)
+    base_url = config.get("base_url") or ""
+
+    # Auto-detect provider from key prefix if no explicit base_url
+    if not base_url:
+        if api_key.startswith("sk-ant-"):
+            # Anthropic key — use their OpenAI-compatible endpoint
+            base_url = "https://api.anthropic.com/v1/"
+        # openrouter keys start with "sk-or-" — use their base URL
+        elif api_key.startswith("sk-or-"):
+            base_url = "https://openrouter.ai/api/v1/"
+
+    kwargs: dict = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
     return OpenAI(**kwargs)
 
 
