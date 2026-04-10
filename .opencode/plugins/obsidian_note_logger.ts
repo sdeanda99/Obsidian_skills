@@ -1,4 +1,4 @@
-import type { PluginInput } from "@opencode-ai/plugin"
+import type { PluginInput, PluginOptions } from "@opencode-ai/plugin"
 import { resolve } from "path"
 import { writeFileSync, unlinkSync } from "fs"
 import { tmpdir } from "os"
@@ -43,8 +43,10 @@ interface NoteLoggerConfig {
 
 // ── Config loader ──────────────────────────────────────────────────────────
 
-function loadConfig(project: Record<string, unknown>): NoteLoggerConfig {
-  const raw = (project["obsidian_note_logger"] ?? {}) as Partial<NoteLoggerConfig>
+function loadConfig(options: Record<string, unknown>): NoteLoggerConfig {
+  // Options from the plugin tuple [path, {"obsidian_note_logger": {...}}]
+  // arrive here as the top-level options object.
+  const raw = (options["obsidian_note_logger"] ?? {}) as Partial<NoteLoggerConfig>
   return {
     model: raw.model ?? null,
     base_url: raw.base_url ?? null,
@@ -76,9 +78,14 @@ function getOrCreate(sessions: Map<string, SessionData>, sid: string): SessionDa
 }
 
 // ── Plugin export ──────────────────────────────────────────────────────────
+// Use named export (not default) — matches the pattern OpenCode expects.
+// Options from the plugin tuple [path, options] arrive as the second argument.
 
-export default async function ({ project, client, worktree, $ }: PluginInput) {
-  const config = loadConfig(project)
+export const ObsidianNoteLoggerPlugin = async (
+  { client, worktree, $ }: PluginInput,
+  options: PluginOptions = {},
+) => {
+  const config = loadConfig(options)
   const sessions = new Map<string, SessionData>()
   const SCRIPT = resolve(import.meta.dir, "../tools/obsidian_note_writer.py")
 
@@ -94,7 +101,7 @@ export default async function ({ project, client, worktree, $ }: PluginInput) {
     body: {
       service: "obsidian-note-logger",
       level: "info",
-      message: "obsidian_note_logger loaded — watching sessions for Decisions and Patterns",
+      message: `obsidian_note_logger loaded — vault=${config.vault} min_tools=${config.min_tool_calls} min_msgs=${config.min_messages}`,
     },
   })
 
@@ -193,6 +200,11 @@ export default async function ({ project, client, worktree, $ }: PluginInput) {
     "event": async ({ event }: { event: any }) => {
       const type = event?.type
       const props = event?.properties ?? {}
+
+      // Diagnostic: log every event type so we can confirm the hook fires
+      await client.app.log({
+        body: { service: "obsidian-note-logger", level: "debug", message: `event: ${type}` },
+      })
 
       if (type === "message.updated") {
         // props.info is a Message (UserMessage | AssistantMessage)
