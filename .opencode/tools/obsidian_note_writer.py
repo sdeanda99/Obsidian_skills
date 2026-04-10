@@ -558,7 +558,7 @@ Skip (should_capture: false) if: purely exploratory with no outcome, trivial/rea
             {"role": "system", "content": system},
             {"role": "user", "content": f"Session transcript:\n\n{transcript}"},
         ],
-        max_tokens=500,
+        max_tokens=1000,
         temperature=0,
     )
     raw = response.choices[0].message.content.strip()
