@@ -104,14 +104,20 @@ export const ObsidianNoteLoggerPlugin = async (
 ) => {
   const config = loadConfig(directory)
   const sessions = new Map<string, SessionData>()
+  // Bug fix: prevent same session from re-firing after it's been processed.
+  // Without this, message.updated events after sessions.delete() re-create the
+  // session entry via getOrCreate(), causing duplicate note writes on subsequent idle events.
+  const processedSessions = new Set<string>()
   const SCRIPT = resolve(import.meta.dir, "../tools/obsidian_note_writer.py")
 
-  // Obsidian tool names — any of these firing updates lastObsidianWriteAt (Option B)
+  // Obsidian tool names — actual registered names have obsidian_ prefix
+  // Bug fix: was using bare names (createNote) but registry uses obsidian_createNote
   const OBSIDIAN_TOOLS = new Set([
-    "createNote", "readNote", "appendToNote", "deleteNote", "listFiles",
-    "setProperty", "readProperty", "removeProperty", "listProperties",
-    "listTags", "listTasks", "toggleTask", "getBacklinks", "getOrphans",
-    "readDailyNote", "appendToDailyNote", "evalJs",
+    "obsidian_createNote", "obsidian_readNote", "obsidian_appendToNote", "obsidian_deleteNote",
+    "obsidian_listFiles", "obsidian_setProperty", "obsidian_readProperty", "obsidian_removeProperty",
+    "obsidian_listProperties", "obsidian_listTags", "obsidian_listTasks", "obsidian_toggleTask",
+    "obsidian_getBacklinks", "obsidian_getOrphans", "obsidian_readDailyNote", "obsidian_appendToDailyNote",
+    "obsidian_evalJs",
   ])
 
   await client.app.log({
@@ -131,6 +137,8 @@ export const ObsidianNoteLoggerPlugin = async (
   ) => {
     const sid = input.sessionID
     if (!sid) return
+    // Don't re-create session data for already-processed sessions
+    if (processedSessions.has(sid)) return
     const s = getOrCreate(sessions, sid)
     const toolName = input.tool ?? "unknown"
     const now = new Date().toISOString()
@@ -150,6 +158,8 @@ export const ObsidianNoteLoggerPlugin = async (
 
   const handleSessionIdle = async (sid: string) => {
     if (!sid) return
+    // Guard: never re-process a session that already completed (success or skip)
+    if (processedSessions.has(sid)) return
     const s = sessions.get(sid)
     if (!s) return
 
@@ -210,6 +220,9 @@ export const ObsidianNoteLoggerPlugin = async (
         try { unlinkSync(configPath) } catch {}
       }
     } finally {
+      // Mark as processed BEFORE deleting — prevents getOrCreate() from re-creating
+      // the entry when message.updated fires after this idle event.
+      processedSessions.add(sid)
       sessions.delete(sid)
     }
   }
@@ -236,6 +249,8 @@ export const ObsidianNoteLoggerPlugin = async (
         if (!msg) return
         const sid = msg.sessionID
         if (!sid) return
+        // Don't re-create session data for already-processed sessions
+        if (processedSessions.has(sid)) return
         const s = getOrCreate(sessions, sid)
         const msgID = msg.id ?? `msg-${Date.now()}`
 

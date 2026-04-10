@@ -506,30 +506,51 @@ class ClassifyResult:
     project: str
     topics: list
     reasoning: str
+    problems: list  # specific problems encountered in the session
+    solutions: list  # solutions applied (parallel to problems)
+    patterns_observed: list  # coding/architecture patterns that appeared
 
 
 def classify_and_extract(
     client, model: str, transcript: str, skill_prompt: str
 ) -> ClassifyResult:
     """
-    Gate D: Merged classify + context extract call using json_object structured output.
-    Returns ClassifyResult. Falls back to text parsing if provider rejects json_object mode.
+    Gate D: Merged classify + context extract call.
+    Extracts problems, solutions, and patterns from the session in addition to
+    standard classification fields. Returns ClassifyResult.
     """
     system = f"""{skill_prompt}
 
-You are a classifier and context extractor. Analyze this OpenCode session transcript and
-return a JSON object with these exact fields:
+You are a classifier and context extractor for a developer knowledge base.
+Analyze this OpenCode session transcript and return a JSON object with EXACTLY these fields:
+
 {{
   "should_capture": true or false,
-  "note_type": "decision" or "pattern",
+  "note_type": "decision" | "pattern" | "learning" | "problem-solution",
   "project": "kebab-case-project-name",
   "topics": ["topic1", "topic2"],
-  "reasoning": "One sentence explaining why this should or should not be captured."
+  "reasoning": "One sentence explaining why this should or should not be captured.",
+  "problems": ["Problem 1 encountered", "Problem 2 encountered"],
+  "solutions": ["Solution applied for problem 1", "Solution applied for problem 2"],
+  "patterns_observed": ["Reusable pattern or convention observed", "Another pattern"]
 }}
 
-Capture if: the session contains an architectural decision, a technical trade-off choice,
-or a reusable solution pattern worth preserving in a developer knowledge base.
-Do not capture if: the session is exploratory, trivial, or contains no clear outcome.
+Note type guide:
+- "decision": an architectural or technical choice was made between options
+- "pattern": a reusable solution, approach, or convention emerged that applies beyond this session
+- "learning": something new was discovered, understood, or debugged — knowledge gain without a clear decision
+- "problem-solution": a specific concrete problem was hit and fixed — use when there's no broader pattern but the fix is worth preserving
+
+For problems/solutions: scan ALL tool calls and error messages. List specific errors hit,
+commands that failed, bugs encountered, and exactly what fixed them. Keep each item concise (1-2 sentences).
+For patterns_observed: list any coding conventions, architectural approaches, or optimization
+techniques that appeared repeatedly or are worth reusing in future sessions.
+
+Capture (should_capture: true) if: the session contains a decision, reusable pattern, a learning worth
+preserving, or a problem+solution pair that would save time if encountered again.
+Skip (should_capture: false) if: purely exploratory with no outcome, trivial/read-only operations only.
+
+"problems" and "solutions" may be empty lists [] if no concrete problems were encountered.
 """
     response = client.chat.completions.create(
         model=model,
@@ -537,7 +558,7 @@ Do not capture if: the session is exploratory, trivial, or contains no clear out
             {"role": "system", "content": system},
             {"role": "user", "content": f"Session transcript:\n\n{transcript}"},
         ],
-        max_tokens=200,
+        max_tokens=500,
         temperature=0,
     )
     raw = response.choices[0].message.content.strip()
@@ -554,6 +575,9 @@ Do not capture if: the session is exploratory, trivial, or contains no clear out
         project=data.get("project", "unknown"),
         topics=data.get("topics", []),
         reasoning=data.get("reasoning", ""),
+        problems=data.get("problems", []),
+        solutions=data.get("solutions", []),
+        patterns_observed=data.get("patterns_observed", []),
     )
 
 
@@ -569,7 +593,13 @@ def search_related_notes(
     Returns list of {"path": str, "content": str} dicts (up to 2).
     Returns [] gracefully on any error (Omnisearch unavailable, timeout, etc.).
     """
-    folder_prefix = "Decisions/" if note_type.lower() == "decision" else "Patterns/"
+    folder_map = {
+        "decision": "Decisions/",
+        "pattern": "Patterns/",
+        "learning": "Learnings/",
+        "problem-solution": "Learnings/",
+    }
+    folder_prefix = folder_map.get(note_type.lower(), "Learnings/")
     query = f"{project} {' '.join(topics)}"
     encoded = urllib.parse.quote(query)
     url = f"http://localhost:51361/search?q={encoded}"
@@ -633,6 +663,38 @@ def generate_note(
             "Create if the content is sufficiently distinct."
         )
 
+    # Build the problems/solutions block if we have them
+    ps_block = ""
+    if classification.problems:
+        pairs = []
+        for i, prob in enumerate(classification.problems):
+            sol = (
+                classification.solutions[i]
+                if i < len(classification.solutions)
+                else "Not documented"
+            )
+            pairs.append(f"- **Problem:** {prob}\n  **Solution:** {sol}")
+        ps_block = (
+            "\n\nProblems and solutions extracted from session (include these in a ## Problems & Solutions section):\n"
+            + "\n".join(pairs)
+        )
+
+    patterns_block = ""
+    if classification.patterns_observed:
+        patterns_block = (
+            "\n\nPatterns observed in session (weave into the note body where relevant):\n"
+            + "\n".join(f"- {p}" for p in classification.patterns_observed)
+        )
+
+    # Folder routing by note type
+    folder_map = {
+        "decision": "Decisions",
+        "pattern": "Patterns",
+        "learning": "Learnings",
+        "problem-solution": "Learnings",
+    }
+    note_folder = folder_map.get(classification.note_type.lower(), "Learnings")
+
     system = f"""{skill_prompt}
 
 You are a developer knowledge base writer. Given an OpenCode session transcript,
@@ -643,14 +705,14 @@ You MUST respond in exactly this format — two sections separated by the delimi
 SECTION 1: A JSON object on its own lines (no markdown fences):
 {{
   "action": "create",
-  "path": "Decisions/YYYY-MM-DD-short-slug.md",
+  "path": "{note_folder}/YYYY-MM-DD-short-slug.md",
   "existing_path": null
 }}
 
 SECTION 2: The literal string ---NOTE--- on its own line, followed by the complete note content.
 
 Example response:
-{{"action": "create", "path": "Decisions/{today}-example.md", "existing_path": null}}
+{{"action": "create", "path": "{note_folder}/{today}-example.md", "existing_path": null}}
 ---NOTE---
 ---
 type: {classification.note_type}
@@ -664,13 +726,14 @@ project: {classification.project}
 Rules:
 - action "enrich": set existing_path to the path being updated, path = existing_path
 - action "create": set existing_path to null
-- path must start with Decisions/ or Patterns/ matching the note type
+- path MUST start with {note_folder}/ — this is the correct folder for {classification.note_type} notes
 - path filename (for create): YYYY-MM-DD-kebab-case-slug.md (today is {today})
 - The note content after ---NOTE--- is the COMPLETE note (not a diff — full replacement)
-- frontmatter fields: type, project, status (decisions only), tags, created, updated
+- frontmatter fields: type, project, tags, created, updated (add decision-status for decisions)
 - created and updated should be {today}
 - Use the schema from the skill instructions above for section headings
-- Be specific — extract actual content from the transcript, not generic summaries
+- ALWAYS include a ## Problems & Solutions section if any problems were encountered (even in decision/pattern notes)
+- Be specific — extract actual content from the transcript, not generic summaries{ps_block}{patterns_block}
 {existing_block}
 """
     response = client.chat.completions.create(
@@ -720,11 +783,29 @@ Rules:
     return data
 
 
+def _slug_to_moc_candidates(project: str) -> list[str]:
+    """
+    Generate candidate MOC filenames from a kebab-case project slug.
+    Handles the common pattern where MOC files use PascalCase + -MOC suffix.
+    e.g. "obsidian-note-logger" → ["ObsidianNoteLogger-MOC", "obsidian-note-logger-MOC",
+                                    "ObsidianNoteLogger", "obsidian-note-logger"]
+    """
+    # PascalCase conversion: split on hyphens, capitalise each part
+    pascal = "".join(part.capitalize() for part in project.split("-"))
+    return [
+        f"Projects/{pascal}-MOC.md",
+        f"Projects/{project}-MOC.md",
+        f"Projects/{pascal}.md",
+        f"Projects/{project}.md",
+    ]
+
+
 def insert_moc_link(
     note_path: str, note_type: str, client: ObsidianClient
 ) -> tuple[bool, str]:
     """
     Insert a wikilink to the note into the project MOC under the appropriate heading.
+    Tries multiple candidate MOC paths (PascalCase-MOC, kebab-MOC, etc.).
     Returns (success, warning_or_error).
     """
     ok, content, err = client.read(note_path)
@@ -742,15 +823,29 @@ def insert_moc_link(
             "No 'project' field found in note frontmatter — skipping MOC insert",
         )
 
-    moc_path = f"Projects/{project}.md"
-    ok, moc_content, _ = client.read(moc_path)
-    if not ok:
+    # Try multiple candidate MOC paths
+    moc_path = None
+    moc_content = ""
+    for candidate in _slug_to_moc_candidates(project):
+        ok, candidate_content, _ = client.read(candidate)
+        if ok and candidate_content:
+            moc_path = candidate
+            moc_content = candidate_content
+            break
+
+    if moc_path is None:
+        candidates_tried = ", ".join(_slug_to_moc_candidates(project))
         return (
             False,
-            f"MOC not found at {moc_path} — skipping MOC insert (note was still created)",
+            f"MOC not found (tried: {candidates_tried}) — skipping MOC insert (note was still created)",
         )
 
-    heading_map = {"decision": "## Decisions", "pattern": "## Patterns"}
+    heading_map = {
+        "decision": "## Architecture Decisions",
+        "pattern": "## Patterns",
+        "learning": "## Learnings",
+        "problem-solution": "## Learnings",
+    }
     heading = heading_map.get(note_type.lower(), "## Notes")
 
     note_stem = Path(note_path).stem
