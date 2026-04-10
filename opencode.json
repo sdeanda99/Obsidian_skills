@@ -1,17 +1,24 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "instructions": ["AGENTS.md"],
-  "obsidian_note_logger": {
-    "model": null,
-    "base_url": null,
-    "api_key": null,
-    "vault": null,
-    "note_skill": "obsidian-dev-notes",
-    "min_tool_calls": 2,
-    "min_messages": 3,
-    "log_path": "wiki/log.md",
-    "log_enabled": true,
-    "toast_enabled": true,
-    "os_notify": false
-  }
+  "plugin": [
+    [
+      ".opencode/plugins/obsidian_note_logger.ts",
+      {
+        "obsidian_note_logger": {
+          "model": null,
+          "base_url": null,
+          "api_key": null,
+          "vault": "Diddys_Diaries",
+          "note_skill": "obsidian-dev-notes",
+          "min_tool_calls": 2,
+          "min_messages": 3,
+          "log_path": "wiki/log.md",
+          "log_enabled": true,
+          "toast_enabled": true,
+          "os_notify": true
+        }
+      }
+    ]
+  ]
 }
