@@ -118,7 +118,7 @@ export const ObsidianNoteLoggerPlugin = async (
     body: {
       service: "obsidian-note-logger",
       level: "info",
-      message: `obsidian_note_logger loaded — vault=${config.vault} min_tools=${config.min_tool_calls} min_msgs=${config.min_messages} | raw_options_keys=${JSON.stringify(Object.keys(options))}`,
+      message: `obsidian_note_logger loaded — vault=${config.vault} min_tools=${config.min_tool_calls} min_msgs=${config.min_messages}`,
     },
   })
 
