@@ -60,6 +60,21 @@ function loadConfig(project: Record<string, unknown>): NoteLoggerConfig {
   }
 }
 
+// ── Session helpers ────────────────────────────────────────────────────────
+
+function getOrCreate(sessions: Map<string, SessionData>, sid: string): SessionData {
+  if (!sessions.has(sid)) {
+    sessions.set(sid, {
+      sessionID: sid,
+      toolCalls: [],
+      messages: [],
+      startedAt: new Date().toISOString(),
+      lastObsidianWriteAt: null,
+    })
+  }
+  return sessions.get(sid)!
+}
+
 // ── Plugin export ──────────────────────────────────────────────────────────
 
 export default async function ({ project, client, worktree, $ }: PluginInput) {
@@ -83,129 +98,143 @@ export default async function ({ project, client, worktree, $ }: PluginInput) {
     },
   })
 
-  return {
-    "tool.execute.after": async (event: any) => {
-      const sid = event.sessionID
-      if (!sid) return
-      if (!sessions.has(sid)) {
-        sessions.set(sid, {
-          sessionID: sid,
-          toolCalls: [],
-          messages: [],
-          startedAt: new Date().toISOString(),
-          lastObsidianWriteAt: null,
-        })
-      }
-      const s = sessions.get(sid)!
-      const toolName = event.tool ?? "unknown"
-      const now = new Date().toISOString()
-      s.toolCalls.push({
-        tool: toolName,
-        input: event.input ?? {},
-        output: event.output ?? "",
-        timestamp: now,
-      })
-      // Delta capture: track last Obsidian vault touch (Option B)
-      if (OBSIDIAN_TOOLS.has(toolName)) {
-        s.lastObsidianWriteAt = now
-      }
-    },
+  // ── tool.execute.after — track tool calls per session ──────────────────
+  // Signature: (input: {tool, sessionID, callID, args}, output: {title, output, metadata})
 
-    "message.updated": async (event: any) => {
-      const sid = event.sessionID
-      if (!sid) return
-      if (!sessions.has(sid)) {
-        sessions.set(sid, {
-          sessionID: sid,
-          toolCalls: [],
-          messages: [],
-          startedAt: new Date().toISOString(),
-          lastObsidianWriteAt: null,
-        })
-      }
-      const s = sessions.get(sid)!
-      const msgID = event.messageID ?? event.id ?? `msg-${Date.now()}`
-      const content = typeof event.content === "string"
-        ? event.content
-        : (event.content?.text ?? event.content?.value ?? "")
-      const role = event.role ?? "assistant"
-      // Upsert by message ID (handles streaming — last write wins)
-      const existing = s.messages.findIndex((m) => m.id === msgID)
-      if (existing >= 0) {
-        s.messages[existing] = { id: msgID, role, content, timestamp: new Date().toISOString() }
-      } else {
-        s.messages.push({ id: msgID, role, content, timestamp: new Date().toISOString() })
-      }
-    },
+  const handleToolAfter = async (
+    input: { tool: string; sessionID: string; callID: string; args: any },
+    output: { title: string; output: string; metadata: any },
+  ) => {
+    const sid = input.sessionID
+    if (!sid) return
+    const s = getOrCreate(sessions, sid)
+    const toolName = input.tool ?? "unknown"
+    const now = new Date().toISOString()
+    s.toolCalls.push({
+      tool: toolName,
+      input: input.args ?? {},
+      output: output.output ?? "",
+      timestamp: now,
+    })
+    // Delta capture: track last Obsidian vault touch (Option B)
+    if (OBSIDIAN_TOOLS.has(toolName)) {
+      s.lastObsidianWriteAt = now
+    }
+  }
 
-    "session.idle": async (event: any) => {
-      const sid = event.sessionID ?? event.id
-      if (!sid) return
-      const s = sessions.get(sid)
-      if (!s) return
+  // ── Trigger Python worker when session goes idle ───────────────────────
 
-      // Gate B: threshold check
-      if (s.toolCalls.length < config.min_tool_calls) return
-      if (s.messages.length < config.min_messages) return
+  const handleSessionIdle = async (sid: string) => {
+    if (!sid) return
+    const s = sessions.get(sid)
+    if (!s) return
 
-      // Write transcript and config to temp files
-      const transcriptPath = `${tmpdir()}/opencode-session-${sid}.json`
-      const configPath = `${tmpdir()}/opencode-config-${sid}.json`
+    // Gate: threshold check
+    if (s.toolCalls.length < config.min_tool_calls) return
+    if (s.messages.length < config.min_messages) return
 
-      // Single outer try/finally guarantees sessions.delete(sid) always runs
+    const transcriptPath = `${tmpdir()}/opencode-session-${sid}.json`
+    const configPath = `${tmpdir()}/opencode-config-${sid}.json`
+
+    // Outer try/finally guarantees sessions.delete(sid) always runs
+    try {
       try {
-        try {
-          writeFileSync(transcriptPath, JSON.stringify(s, null, 2))
-          writeFileSync(configPath, JSON.stringify(config, null, 2))
-        } catch (err: any) {
-          await client.app.log({
-            body: {
-              service: "obsidian-note-logger",
-              level: "error",
-              message: `Failed to write IPC files: ${err.message}`,
-            },
-          })
-          return
-        }
-
-        // Shell out to Python worker
-        try {
-          const result = await $`python3 ${SCRIPT} ${transcriptPath} ${configPath} ${worktree}`.text()
-          const parsed = JSON.parse(result.trim())
-
-          if (parsed.status === "written" && config.toast_enabled) {
-            await client.tui.showToast({
-              body: { message: `Note written: ${parsed.path}`, variant: "success" },
-            })
-          }
-          // "skipped" status: no toast per spec
-        } catch (err: any) {
-          // Python exited non-zero or JSON parse failed
-          await client.app.log({
-            body: {
-              service: "obsidian-note-logger",
-              level: "error",
-              message: `Note writer failed: ${err.message}`,
-            },
-          })
-          if (config.toast_enabled) {
-            await client.tui.showToast({
-              body: { message: "Obsidian note failed — check wiki/log.md", variant: "error" },
-            })
-          }
-          // Clean up temp files on failure (Python cleans them on success)
-          try { unlinkSync(transcriptPath) } catch {}
-          try { unlinkSync(configPath) } catch {}
-        }
-      } finally {
-        // Always remove from in-memory store regardless of IPC write outcome
-        sessions.delete(sid)
+        writeFileSync(transcriptPath, JSON.stringify(s, null, 2))
+        writeFileSync(configPath, JSON.stringify(config, null, 2))
+      } catch (err: any) {
+        await client.app.log({
+          body: {
+            service: "obsidian-note-logger",
+            level: "error",
+            message: `Failed to write IPC files: ${err.message}`,
+          },
+        })
+        return
       }
-    },
 
-    "session.deleted": async (event: any) => {
-      const sid = event.sessionID
-      if (sid) sessions.delete(sid)
+      try {
+        const result = await $`python3 ${SCRIPT} ${transcriptPath} ${configPath} ${worktree}`.text()
+        const parsed = JSON.parse(result.trim())
+
+        if (parsed.status === "written" && config.toast_enabled) {
+          await client.tui.showToast({
+            body: { message: `Note written: ${parsed.path}`, variant: "success" },
+          })
+        }
+        // "skipped" status: no toast per spec
+      } catch (err: any) {
+        await client.app.log({
+          body: {
+            service: "obsidian-note-logger",
+            level: "error",
+            message: `Note writer failed: ${err.message}`,
+          },
+        })
+        if (config.toast_enabled) {
+          await client.tui.showToast({
+            body: { message: "Obsidian note failed — check wiki/log.md", variant: "error" },
+          })
+        }
+        try { unlinkSync(transcriptPath) } catch {}
+        try { unlinkSync(configPath) } catch {}
+      }
+    } finally {
+      sessions.delete(sid)
+    }
+  }
+
+  return {
+    // ── tool.execute.after — correct two-argument signature ──────────────
+    "tool.execute.after": handleToolAfter,
+
+    // ── event — single generic handler dispatching by event.type ─────────
+    // Replaces the invalid "message.updated", "session.idle", "session.deleted" keys.
+    // All SDK events arrive here; we only act on the three we care about.
+    "event": async ({ event }: { event: any }) => {
+      const type = event?.type
+      const props = event?.properties ?? {}
+
+      if (type === "message.updated") {
+        // props.info is a Message (UserMessage | AssistantMessage)
+        const msg = props.info
+        if (!msg) return
+        const sid = msg.sessionID
+        if (!sid) return
+        const s = getOrCreate(sessions, sid)
+        const msgID = msg.id ?? `msg-${Date.now()}`
+
+        // Extract text content from parts (AssistantMessage) or text (UserMessage)
+        let content = ""
+        if (Array.isArray(msg.parts)) {
+          content = msg.parts
+            .filter((p: any) => p.type === "text")
+            .map((p: any) => p.text ?? "")
+            .join("")
+        } else if (typeof msg.text === "string") {
+          content = msg.text
+        }
+        const role = msg.role ?? "assistant"
+
+        // Upsert by message ID (handles streaming — last write wins)
+        const existing = s.messages.findIndex((m) => m.id === msgID)
+        if (existing >= 0) {
+          s.messages[existing] = { id: msgID, role, content, timestamp: new Date().toISOString() }
+        } else {
+          s.messages.push({ id: msgID, role, content, timestamp: new Date().toISOString() })
+        }
+      }
+
+      else if (type === "session.idle") {
+        // props.sessionID
+        const sid = props.sessionID
+        await handleSessionIdle(sid)
+      }
+
+      else if (type === "session.deleted") {
+        // props.info is a Session object with id field
+        const sid = props.info?.id ?? props.sessionID
+        if (sid) sessions.delete(sid)
+      }
     },
   }
 }
