@@ -203,6 +203,11 @@ export const ObsidianNoteLoggerPlugin = async (
           })
         }
         // "skipped" status: no toast per spec
+
+        // Only lock the session out on success/skip — errors stay retryable.
+        // If we added to processedSessions on error, a transient LLM failure
+        // would permanently block this session from ever being captured.
+        processedSessions.add(sid)
       } catch (err: any) {
         await client.app.log({
           body: {
@@ -213,16 +218,15 @@ export const ObsidianNoteLoggerPlugin = async (
         })
         if (config.toast_enabled) {
           await client.tui.showToast({
-            body: { message: "Obsidian note failed — check wiki/log.md", variant: "error" },
+            body: { message: "Obsidian note failed — will retry on next idle", variant: "error" },
           })
         }
         try { unlinkSync(transcriptPath) } catch {}
         try { unlinkSync(configPath) } catch {}
+        // Do NOT add to processedSessions — next idle can retry after user sends a message
       }
     } finally {
-      // Mark as processed BEFORE deleting — prevents getOrCreate() from re-creating
-      // the entry when message.updated fires after this idle event.
-      processedSessions.add(sid)
+      // Always clean up in-memory session data regardless of outcome
       sessions.delete(sid)
     }
   }
