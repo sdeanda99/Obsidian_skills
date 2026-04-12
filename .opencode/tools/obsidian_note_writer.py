@@ -511,6 +511,181 @@ class ClassifyResult:
     patterns_observed: list  # coding/architecture patterns that appeared
 
 
+ERROR_SIGNALS = {
+    "error",
+    "exception",
+    "failed",
+    "traceback",
+    "exit 1",
+    "syntaxerror",
+    "typeerror",
+    "filenotfounderror",
+    "unterminated",
+    "expecting value",
+    "cannot",
+    "not found",
+    "no such file",
+    "connectionrefused",
+    "timeout",
+    "attributeerror",
+    "keyerror",
+    "nameerror",
+    "importerror",
+    "modulenotfounderror",
+    "valueerror",
+    "assertionerror",
+    "permission denied",
+}
+RESOLUTION_SIGNALS = {
+    "success",
+    "ok\n",
+    "written",
+    "pushed",
+    "passed",
+    "fixed",
+    "done",
+    "created",
+    "committed",
+    "resolved",
+    "syntax ok",
+}
+
+
+def _is_error(text: str) -> bool:
+    t = text.lower()
+    return any(sig in t for sig in ERROR_SIGNALS)
+
+
+def _is_resolution(text: str) -> bool:
+    t = text.lower()
+    return any(sig in t for sig in RESOLUTION_SIGNALS) and not _is_error(t)
+
+
+@dataclass
+class ReasoningArc:
+    problem_signal: str  # the error text that triggered this arc
+    pre_reasoning: list  # assistant messages in the 5 events before the error (full, no truncation)
+    tool_sequence: list  # tool calls from error through resolution
+    resolution: str  # the output that resolved the error (or "")
+    post_reasoning: list  # assistant messages after resolution (full, no truncation)
+    start_ts: str
+    end_ts: str
+
+
+def extract_reasoning_chains(session: dict) -> list[ReasoningArc]:
+    """
+    Scan the session timeline for error→fix arcs.
+    Returns one ReasoningArc per distinct error signal found.
+    Does NOT include a "general" arc — Path A (full-log classification) handles non-error content.
+
+    Deep capture: assistant message content is NOT truncated (unlike old format_transcript which
+    truncated to 2000 chars). We want the full reasoning narrative for each arc.
+    """
+    # Build merged timeline sorted by timestamp
+    timeline = []
+    for msg in session.get("messages", []):
+        timeline.append(
+            {
+                "kind": "message",
+                "role": msg.get("role", "unknown"),
+                "content": msg.get("content", ""),
+                "ts": msg.get("timestamp", ""),
+            }
+        )
+    for tc in session.get("toolCalls", []):
+        output_str = str(tc.get("output", ""))
+        timeline.append(
+            {
+                "kind": "tool",
+                "tool": tc.get("tool", "unknown"),
+                "input": tc.get("input", {}),
+                "output": output_str,
+                "ts": tc.get("timestamp", ""),
+            }
+        )
+    timeline.sort(key=lambda x: x["ts"])
+
+    arcs = []
+    used_indices = set()
+
+    for i, event in enumerate(timeline):
+        if event["kind"] != "tool":
+            continue
+        if not _is_error(event["output"]):
+            continue
+        if i in used_indices:
+            continue
+
+        # Pre-context: up to 5 events back, assistant messages only — full content, no truncation
+        pre = []
+        for j in range(max(0, i - 5), i):
+            e = timeline[j]
+            if e["kind"] == "message" and e["role"] == "assistant":
+                pre.append(e["content"])
+
+        # Forward context: up to 10 events ahead until resolution
+        tools_in_arc = [event]
+        post = []
+        resolution = ""
+        end_idx = i
+        for j in range(i + 1, min(len(timeline), i + 11)):
+            e = timeline[j]
+            used_indices.add(j)
+            if e["kind"] == "tool":
+                tools_in_arc.append(e)
+                if _is_resolution(e["output"]):
+                    resolution = e["output"][:1000]
+                    end_idx = j
+                    break
+            elif e["kind"] == "message" and e["role"] == "assistant":
+                post.append(e["content"])  # full content, no truncation
+
+        used_indices.add(i)
+        arcs.append(
+            ReasoningArc(
+                problem_signal=event["output"][:1000],
+                pre_reasoning=pre,
+                tool_sequence=tools_in_arc,
+                resolution=resolution,
+                post_reasoning=post,
+                start_ts=timeline[max(0, i - 5)]["ts"],
+                end_ts=timeline[end_idx]["ts"],
+            )
+        )
+
+    return arcs
+
+
+def format_arc(arc: ReasoningArc) -> str:
+    """Format a single ReasoningArc into LLM-readable reasoning chain text."""
+    lines = ["=== REASONING CHAIN (problem → solution) ==="]
+
+    if arc.pre_reasoning:
+        lines.append("\n-- Agent reasoning before error --")
+        for r in arc.pre_reasoning:
+            lines.append(f"[ASSISTANT]: {r}")
+
+    lines.append(f"\n-- Error signal --\n{arc.problem_signal}")
+
+    lines.append("\n-- Tool sequence during error period --")
+    for tc in arc.tool_sequence:
+        inp = json.dumps(tc.get("input", {}))[:500]
+        out = str(tc.get("output", ""))[:800]
+        lines.append(f"Tool: {tc.get('tool', '?')}")
+        lines.append(f"  Input:  {inp}")
+        lines.append(f"  Output: {out}")
+
+    if arc.post_reasoning:
+        lines.append("\n-- Agent reasoning after error --")
+        for r in arc.post_reasoning:
+            lines.append(f"[ASSISTANT]: {r}")
+
+    if arc.resolution:
+        lines.append(f"\n-- Resolution signal --\n{arc.resolution}")
+
+    return "\n".join(lines)
+
+
 def classify_and_extract(
     client, model: str, transcript: str, skill_prompt: str
 ) -> ClassifyResult:
