@@ -993,13 +993,48 @@ def search_related_notes(
     return related
 
 
+def get_session_commits(worktree: str, session: dict) -> list:
+    """
+    Get git commits made during this session's timespan.
+    Returns list of {hash, subject, date} dicts. Returns [] on any error.
+    """
+    start = session.get("startedAt", "")
+    if not start:
+        return []
+    try:
+        result = subprocess.run(
+            ["git", "log", "--format=%H|%s|%ai", f"--after={start}", "HEAD"],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return []
+        commits = []
+        for line in result.stdout.strip().splitlines():
+            parts = line.split("|", 2)
+            if len(parts) == 3:
+                commits.append(
+                    {
+                        "hash": parts[0][:8],
+                        "subject": parts[1],
+                        "date": parts[2][:10],
+                    }
+                )
+        return commits
+    except Exception:
+        return []
+
+
 def generate_note(
     client,
     model: str,
-    transcript: str,
+    content: str,
     skill_prompt: str,
     classification: ClassifyResult,
     existing_notes: list,
+    commits: list = None,
 ) -> dict:
     """
     Generate a structured Obsidian note from the session transcript.
@@ -1050,6 +1085,16 @@ def generate_note(
             + "\n".join(f"- {p}" for p in classification.patterns_observed)
         )
 
+    commits_block = ""
+    if commits:
+        commits_block = (
+            "\n\nGit commits made during this session — include relevant ones as "
+            "backtick references in the note body (e.g. `a3eab53`):\n"
+            + "\n".join(
+                f"- `{c['hash']}` {c['subject']} ({c['date']})" for c in commits
+            )
+        )
+
     # Folder routing by note type
     folder_map = {
         "decision": "Decisions",
@@ -1097,7 +1142,8 @@ Rules:
 - created and updated should be {today}
 - Use the schema from the skill instructions above for section headings
 - ALWAYS include a ## Problems & Solutions section if any problems were encountered (even in decision/pattern notes)
-- Be specific — extract actual content from the transcript, not generic summaries{ps_block}{patterns_block}
+- Be specific — extract actual content from the transcript, not generic summaries
+- Reference relevant git commits with backtick hash inline: `abc1234`{ps_block}{patterns_block}{commits_block}
 {existing_block}
 """
     response = client.chat.completions.create(
@@ -1110,11 +1156,11 @@ Rules:
                     f"Project: {classification.project}\n"
                     f"Topics: {', '.join(classification.topics)}\n"
                     f"Classification: {classification.reasoning}\n\n"
-                    f"Session transcript:\n\n{transcript}"
+                    f"Session transcript:\n\n{content}"
                 ),
             },
         ],
-        max_tokens=2000,
+        max_tokens=3000,
         temperature=0.3,
     )
     raw = response.choices[0].message.content.strip()
