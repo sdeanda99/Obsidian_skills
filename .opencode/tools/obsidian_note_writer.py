@@ -831,6 +831,73 @@ Rules:
     return results
 
 
+def classify_arc(
+    client, model: str, arc_text: str, skill_prompt: str
+) -> "ClassifyResult | None":
+    """
+    Path B: Classify a single reasoning arc for problem-solution capture.
+    Returns None if the arc is not specific enough to be worth preserving.
+    note_type is always "problem-solution" — decisions/patterns are Path A's job.
+    """
+    system = f"""{skill_prompt}
+
+You are a classifier for a developer knowledge base.
+Analyze this reasoning chain (error → fix sequence) and decide if the
+problem+solution pair is specific enough to save a future developer time.
+
+Return a JSON object:
+{{
+  "should_capture": true or false,
+  "project": "kebab-case-project-name",
+  "topics": ["topic1", "topic2"],
+  "reasoning": "One sentence: what this problem-solution captures.",
+  "problems": ["Specific problem encountered (concise, 1-2 sentences)"],
+  "solutions": ["Exactly what fixed the problem (concise, 1-2 sentences)"]
+}}
+
+Capture (should_capture: true) if:
+- The error has a non-obvious root cause that took investigation to find
+- The fix is specific and actionable (not just "read the docs")
+- Another developer hitting the same error would benefit from this record
+
+Skip (should_capture: false) if:
+- The error is trivial (typo, obvious syntax error)
+- The fix was just "retry" with no insight gained
+- The arc is too vague to be actionable
+
+"problems" and "solutions" must be parallel lists (same length).
+"""
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Reasoning arc:\n\n{arc_text}"},
+        ],
+        max_tokens=600,
+        temperature=0,
+    )
+    raw = response.choices[0].message.content.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.rsplit("```", 1)[0]
+    data = json.loads(raw.strip())
+
+    if not data.get("should_capture"):
+        return None
+    return ClassifyResult(
+        should_capture=True,
+        note_type="problem-solution",
+        project=data.get("project", "unknown"),
+        topics=data.get("topics", []),
+        reasoning=data.get("reasoning", ""),
+        problems=data.get("problems", []),
+        solutions=data.get("solutions", []),
+        patterns_observed=[],
+    )
+
+
 def search_related_notes(
     project: str,
     topics: list,
