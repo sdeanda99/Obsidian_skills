@@ -756,6 +756,81 @@ Skip (should_capture: false) if: purely exploratory with no outcome, trivial/rea
     )
 
 
+def classify_decisions_patterns(
+    client, model: str, transcript: str, skill_prompt: str
+) -> list[ClassifyResult]:
+    """
+    Path A: Classify the FULL session transcript for decisions, patterns, and learnings.
+    Returns a list — one ClassifyResult per distinct capturable item found.
+    No cap on count; LLM decides how many distinct items exist.
+    Does NOT look for problem-solution arcs — that is Path B's job.
+    """
+    system = f"""{skill_prompt}
+
+You are a classifier for a developer knowledge base.
+Analyze the FULL session transcript and identify ALL distinct decisions, patterns,
+and learnings worth capturing as separate Obsidian notes.
+
+Return a JSON object with a single key "items" containing an array.
+Each item in the array represents one distinct capturable thing:
+
+{{
+  "items": [
+    {{
+      "note_type": "decision" | "pattern" | "learning",
+      "project": "kebab-case-project-name",
+      "topics": ["topic1", "topic2"],
+      "reasoning": "One sentence: what this note captures and why it matters.",
+      "patterns_observed": ["Reusable pattern or convention observed"]
+    }},
+    ...
+  ]
+}}
+
+Rules:
+- "decision": an architectural or technical choice between options was made
+- "pattern": a reusable solution, approach, or convention emerged
+- "learning": something discovered, understood, or confirmed — knowledge gain
+- DO NOT include problem-solution arcs — only decisions, patterns, learnings
+- Include an item for EACH distinct topic — do not merge unrelated things into one
+- If nothing is worth capturing, return {{"items": []}}
+- "patterns_observed" may be [] if not applicable
+- Be liberal — if it would save a future developer time, include it
+"""
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Full session transcript:\n\n{transcript}"},
+        ],
+        max_tokens=1500,
+        temperature=0,
+    )
+    raw = response.choices[0].message.content.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.rsplit("```", 1)[0]
+    data = json.loads(raw.strip())
+
+    results = []
+    for item in data.get("items", []):
+        results.append(
+            ClassifyResult(
+                should_capture=True,
+                note_type=item.get("note_type", "learning"),
+                project=item.get("project", "unknown"),
+                topics=item.get("topics", []),
+                reasoning=item.get("reasoning", ""),
+                problems=[],
+                solutions=[],
+                patterns_observed=item.get("patterns_observed", []),
+            )
+        )
+    return results
+
+
 def search_related_notes(
     project: str,
     topics: list,
