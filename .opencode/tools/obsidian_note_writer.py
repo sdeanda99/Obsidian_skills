@@ -509,6 +509,7 @@ class ClassifyResult:
     problems: list  # specific problems encountered in the session
     solutions: list  # solutions applied (parallel to problems)
     patterns_observed: list  # coding/architecture patterns that appeared
+    _arc: object = None  # internal: ReasoningArc for Path B items, None for Path A
 
 
 ERROR_SIGNALS = {
@@ -896,6 +897,52 @@ Skip (should_capture: false) if:
         solutions=data.get("solutions", []),
         patterns_observed=[],
     )
+
+
+def classify_multi(
+    client,
+    model: str,
+    session: dict,
+    arcs: list,
+    skill_prompt: str,
+    transcript: str,
+) -> list:
+    """
+    Run both classification paths and return the combined list.
+
+    Path A: full transcript → decisions, patterns, learnings (one LLM call)
+    Path B: per-arc → problem-solutions (one LLM call per arc)
+
+    Results from both paths are combined with no deduplication —
+    they cover different content (Path A never returns problem-solution,
+    Path B never returns decision/pattern/learning).
+    """
+    results = []
+
+    # Path A: full log for decisions, patterns, learnings
+    try:
+        path_a = classify_decisions_patterns(client, model, transcript, skill_prompt)
+        results.extend(path_a)
+        print(f"Path A: {len(path_a)} items classified", file=sys.stderr)
+    except Exception as e:
+        print(f"Path A classification failed: {e}", file=sys.stderr)
+
+    # Path B: per-arc problem-solution classification
+    for arc in arcs:
+        arc_text = format_arc(arc)
+        try:
+            result = classify_arc(client, model, arc_text, skill_prompt)
+            if result:
+                result._arc = arc
+                results.append(result)
+        except Exception as e:
+            print(f"Path B arc classification failed: {e}", file=sys.stderr)
+
+    print(
+        f"classify_multi total: {len(results)} items ({len(arcs)} arcs scanned)",
+        file=sys.stderr,
+    )
+    return results
 
 
 def search_related_notes(
