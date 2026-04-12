@@ -198,8 +198,12 @@ export const ObsidianNoteLoggerPlugin = async (
         const parsed = JSON.parse(stdout)
 
         if (parsed.status === "written" && config.toast_enabled) {
+          const paths: string[] = parsed.paths ?? (parsed.path ? [parsed.path] : [])
+          const label = paths.length === 1
+            ? `Note written: ${paths[0]}`
+            : `${paths.length} notes written to Obsidian`
           await client.tui.showToast({
-            body: { message: `Note written: ${parsed.path}`, variant: "success" },
+            body: { message: label, variant: "success" },
           })
         }
         // "skipped" status: no toast per spec
