@@ -330,6 +330,35 @@ def load_config(config_path: str) -> dict:
         return json.load(f)
 
 
+def extract_response_content(response) -> str:
+    """
+    Extract text content from an LLM response, handling thinking models correctly.
+
+    Thinking models (nemotron-cascade-2, qwen3-thinking, etc.) sometimes return:
+    - Empty content with all output in the `reasoning` field (temperature=0 edge case)
+    - <think>...</think> tags prepended to content before the actual JSON
+    - A separate `reasoning` field alongside `content`
+
+    This function handles all cases by:
+    1. Getting content from message.content
+    2. If empty, falling back to message.reasoning (thinking models)
+    3. Stripping <think>...</think> blocks from either source
+    """
+    import re
+
+    msg = response.choices[0].message
+    content = (msg.content or "").strip()
+
+    # If content is empty, try the reasoning field (thinking model edge case)
+    if not content:
+        content = (getattr(msg, "reasoning", None) or "").strip()
+
+    # Strip <think>...</think> blocks — thinking models sometimes prepend these
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+    return content
+
+
 def resolve_api_key_and_base_url(config: dict) -> tuple[str, str]:
     """
     Resolve API key and base_url together from config → env vars → auth.json.
@@ -739,7 +768,7 @@ Skip (should_capture: false) if: purely exploratory with no outcome, trivial/rea
         max_tokens=1000,
         temperature=0,
     )
-    raw = response.choices[0].message.content.strip()
+    raw = extract_response_content(response)
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -809,7 +838,7 @@ Rules:
         max_tokens=1500,
         temperature=0,
     )
-    raw = response.choices[0].message.content.strip()
+    raw = extract_response_content(response)
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -879,7 +908,7 @@ Skip (should_capture: false) if:
         max_tokens=600,
         temperature=0,
     )
-    raw = response.choices[0].message.content.strip()
+    raw = extract_response_content(response)
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -1165,7 +1194,7 @@ Rules:
         max_tokens=3000,
         temperature=0.3,
     )
-    raw = response.choices[0].message.content.strip()
+    raw = extract_response_content(response)
 
     # Parse delimiter-based format: JSON metadata + ---NOTE--- + note content
     DELIMITER = "---NOTE---"
