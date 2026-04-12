@@ -393,6 +393,8 @@ def resolve_model(config: dict, base_url: str) -> str:
         return os.environ["OPENCODE_MODEL"]
     if os.environ.get("ANTHROPIC_DEFAULT_MODEL"):
         return os.environ["ANTHROPIC_DEFAULT_MODEL"]
+    if "11434" in base_url:
+        return config.get("ollama_model") or "qwen2:7b"
     # OpenRouter requires provider-namespaced model names
     if "openrouter" in base_url:
         return "anthropic/claude-haiku-4-5"

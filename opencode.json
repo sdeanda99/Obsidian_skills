@@ -9,6 +9,7 @@
           "model": null,
           "base_url": null,
           "api_key": null,
+          "ollama_model": null,
           "vault": "Diddys_Diaries",
           "note_skill": "obsidian-dev-notes",
           "min_tool_calls": 10,
