@@ -8,7 +8,7 @@ description: >
   between related notes. Does NOT create new notes — only updates existing
   ones and the MOC.
 mode: subagent
-model: anthropic/claude-haiku-4-5
+model: ollama/note-drift
 temperature: 0.2
 maxSteps: 30
 tools:
