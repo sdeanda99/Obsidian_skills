@@ -1354,26 +1354,27 @@ if __name__ == "__main__":
         print(f"Failed to build LLM client: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # --- Gate D: Classify & Extract ---
-    try:
-        classification = classify_and_extract(
-            client, model, transcript_text, skill_prompt
-        )
-    except Exception as e:
-        print(f"LLM classification failed: {e}", file=sys.stderr)
-        sys.exit(1)
+    # --- Extract reasoning arcs (Path B input) ---
+    arcs = extract_reasoning_chains(session)
+    print(f"Extracted {len(arcs)} reasoning arcs", file=sys.stderr)
 
-    if not classification.should_capture:
+    # --- Classify both paths ---
+    all_classifications = classify_multi(
+        client, model, session, arcs, skill_prompt, transcript_text
+    )
+
+    if not all_classifications:
         append_log(
             config,
             obsidian,
             (
-                f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — Skipped (not a decision/pattern)\n"
+                f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — Skipped\n"
                 f"- **Session:** {session_id}\n"
-                f"- **Reason:** {classification.reasoning}"
+                f"- **Reason:** No capturable decisions, patterns, learnings, or "
+                f"problem-solutions found across {len(arcs)} arcs"
             ),
         )
-        print(json.dumps({"status": "skipped", "reason": classification.reasoning}))
+        print(json.dumps({"status": "skipped", "reason": "no capturable items"}))
         for tmp in [transcript_path, config_path]:
             try:
                 Path(tmp).unlink()
@@ -1381,125 +1382,149 @@ if __name__ == "__main__":
                 pass
         sys.exit(0)
 
-    # --- Pre-Write Search (dedup check) ---
-    dedup_label = ""
-    try:
-        existing_notes = search_related_notes(
-            classification.project,
-            classification.topics,
-            classification.note_type,
-            obsidian,
+    # --- Get git commits for the session ---
+    commits = get_session_commits(worktree, session)
+
+    # --- Write one note per classification ---
+    written_paths = []
+    for classification in all_classifications:
+        # Use arc text for Path B items, full transcript for Path A items
+        content_for_generate = (
+            format_arc(classification._arc)
+            if classification._arc is not None
+            else transcript_text
         )
-        if existing_notes:
-            dedup_label = f"Found {len(existing_notes)} related"
+
+        # Dedup search
+        try:
+            existing_notes = search_related_notes(
+                classification.project,
+                classification.topics,
+                classification.note_type,
+                obsidian,
+            )
+            dedup_label = (
+                f"Found {len(existing_notes)} related"
+                if existing_notes
+                else "No matches"
+            )
+        except Exception:
+            existing_notes = []
+            dedup_label = "Skipped (Omnisearch unavailable)"
+
+        # Generate
+        try:
+            note = generate_note(
+                client,
+                model,
+                content_for_generate,
+                skill_prompt,
+                classification,
+                existing_notes,
+                commits,
+            )
+        except Exception as e:
+            print(
+                f"Note generation failed for {classification.note_type}: {e}",
+                file=sys.stderr,
+            )
+            append_log(
+                config,
+                obsidian,
+                (
+                    f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} "
+                    f"— ERROR: note generation failed\n"
+                    f"- **Session:** {session_id}\n"
+                    f"- **Type:** {classification.note_type}\n"
+                    f"- **Error:** {e}"
+                ),
+            )
+            continue
+
+        action = note.get("action", "create")
+        note_path = note["path"]
+        note_content = note["content"]
+        existing_path = note.get("existing_path")
+        note_type = classification.note_type
+
+        if action == "enrich" and existing_path:
+            write_path = existing_path
+            action_label = f"Enriched {existing_path}"
         else:
-            dedup_label = "No matches"
-    except Exception:
-        existing_notes = []
-        dedup_label = "Skipped (Omnisearch unavailable)"
+            write_path = note_path
+            action_label = "Created"
 
-    # --- Generate note (enrich or create) ---
-    try:
-        note = generate_note(
-            client, model, transcript_text, skill_prompt, classification, existing_notes
+        ok, _, err = obsidian.create(
+            write_path, note_content, overwrite=(action == "enrich")
         )
-    except Exception as e:
-        print(f"Note generation failed: {e}", file=sys.stderr)
-        append_log(
-            config,
-            obsidian,
-            (
-                f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — ERROR: note generation failed\n"
-                f"- **Session:** {session_id}\n"
-                f"- **Error:** {e}"
-            ),
-        )
-        sys.exit(1)
-
-    action = note.get("action", "create")
-    note_path = note["path"]
-    note_content = note["content"]
-    existing_path = note.get("existing_path")
-    note_type = classification.note_type
-
-    # --- Write note to Obsidian (create or enrich) ---
-    if action == "enrich" and existing_path:
-        write_path = existing_path
-        action_label = f"Enriched {existing_path}"
-    else:
-        write_path = note_path
-        action_label = "Created"
-
-    write_failed = False
-    err = ""
-    ok, _, err = obsidian.create(
-        write_path, note_content, overwrite=(action == "enrich")
-    )
-    if not ok:
-        if action == "enrich":
-            ok2, _, _ = obsidian.create(note_path, note_content, overwrite=False)
-            if ok2:
-                action_label = (
-                    f"Created (enrich fallback — original write failed: {err})"
-                )
-                write_path = note_path
+        if not ok:
+            if action == "enrich":
+                ok2, _, _ = obsidian.create(note_path, note_content, overwrite=False)
+                if ok2:
+                    action_label = f"Created (enrich fallback: {err})"
+                    write_path = note_path
+                else:
+                    append_log(
+                        config,
+                        obsidian,
+                        (
+                            f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} "
+                            f"— ERROR: write failed\n"
+                            f"- **Session:** {session_id}\n- **Error:** {err}"
+                        ),
+                    )
+                    continue
             else:
-                write_failed = True
-        else:
-            write_failed = True
+                append_log(
+                    config,
+                    obsidian,
+                    (
+                        f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} "
+                        f"— ERROR: write failed\n"
+                        f"- **Session:** {session_id}\n- **Error:** {err}"
+                    ),
+                )
+                continue
 
-    if write_failed:
-        print(f"Obsidian write failed: {err}", file=sys.stderr)
+        # MOC insert (best-effort)
+        moc_ok, moc_warn = insert_moc_link(write_path, note_type, obsidian)
+        moc_note = f"\n- **MOC warning:** {moc_warn}" if not moc_ok else ""
+
+        # Log entry
         append_log(
             config,
             obsidian,
             (
-                f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — ERROR: write failed\n"
+                f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} "
+                f"— {note_type.capitalize()} captured\n"
                 f"- **Session:** {session_id}\n"
-                f"- **Error:** obsidian write returned failure\n"
-                f"- **Raw:** {err}"
+                f"- **Action:** {action_label}\n"
+                f"- **Note:** {write_path}\n"
+                f"- **Model:** {model}\n"
+                f"- **Commits referenced:** {len(commits)}\n"
+                f"- **Dedup check:** {dedup_label}\n"
+                f"- **Reasoning:** {classification.reasoning}{moc_note}"
             ),
         )
-        sys.exit(1)
 
-    # --- MOC insert (best-effort) ---
-    moc_ok, moc_warn = insert_moc_link(write_path, note_type, obsidian)
-    moc_note = f"\n- **MOC warning:** {moc_warn}" if not moc_ok else ""
+        written_paths.append(write_path)
 
-    # --- Transaction log ---
-    cutoff = session.get("lastObsidianWriteAt")
-    delta_window = f"since {cutoff}" if cutoff else "full session"
-    tool_count = len(session.get("toolCalls", []))
-    msg_count = len(session.get("messages", []))
-    base_url = config.get("base_url") or "cloud"
-    provider_label = "ollama" if "11434" in base_url else base_url
-    append_log(
-        config,
-        obsidian,
-        (
-            f"## {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} — {note_type.capitalize()} captured\n"
-            f"- **Session:** {session_id}\n"
-            f"- **Action:** {action_label}\n"
-            f"- **Note:** {write_path}\n"
-            f"- **Model:** {model} ({provider_label})\n"
-            f"- **Classified as:** {note_type.capitalize()}\n"
-            f"- **Tool calls logged:** {tool_count}\n"
-            f"- **Messages logged:** {msg_count}\n"
-            f"- **Delta window:** {delta_window}\n"
-            f"- **Dedup check:** {dedup_label}\n"
-            f"- **Classification reasoning:** {classification.reasoning}{moc_note}"
-        ),
-    )
+    # OS notification (one for all notes)
+    if written_paths:
+        label = (
+            written_paths[0]
+            if len(written_paths) == 1
+            else f"{len(written_paths)} notes written"
+        )
+        os_notify(config, "OpenCode → Obsidian", label)
 
-    # --- OS notification ---
-    os_notify(config, "OpenCode → Obsidian", f"Note written: {write_path}")
-
-    # --- Clean up temp files ---
+    # Cleanup temp files
     for tmp in [transcript_path, config_path]:
         try:
             Path(tmp).unlink()
         except Exception:
             pass
 
-    print(json.dumps({"status": "written", "path": note_path}))
+    status = "written" if written_paths else "skipped"
+    print(json.dumps({"status": status, "paths": written_paths}))
     sys.exit(0)
