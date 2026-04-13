@@ -1,4 +1,4 @@
 FROM nemotron-cascade-2:latest
-PARAMETER num_ctx 131072
+PARAMETER num_ctx 250000
 PARAMETER temperature 0
 PARAMETER repeat_penalty 1.0
