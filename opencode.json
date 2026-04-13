@@ -31,6 +31,7 @@
       ".opencode/plugins/obsidian_note_logger.ts",
       {
         "obsidian_note_logger": {
+          "project": "obsidian-note-logger",
           "model": "notetaker",
           "base_url": "http://localhost:11434/v1",
           "api_key": "ollama",
