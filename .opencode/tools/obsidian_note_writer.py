@@ -1515,6 +1515,8 @@ if __name__ == "__main__":
 
     transcript_path = sys.argv[1]
     config_path = sys.argv[2]
+    worktree = sys.argv[3] if len(sys.argv) > 3 else os.getcwd()
+    opencode_json_path = sys.argv[4] if len(sys.argv) > 4 else None
 
     # --- Load inputs ---
     try:
@@ -1531,7 +1533,6 @@ if __name__ == "__main__":
 
     vault = config.get("vault") or None
     obsidian = ObsidianClient(vault, config)
-    worktree = sys.argv[3] if len(sys.argv) > 3 else os.getcwd()
     skill_prompt = load_skill_prompt(config, worktree)
     transcript_text = format_transcript(session)
     session_id = session["sessionID"]
@@ -1544,14 +1545,35 @@ if __name__ == "__main__":
         print(f"Failed to build LLM client: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # --- Resolve authoritative project slug ---
+    resolved_project, project_mismatch = resolve_project_slug(
+        config,
+        opencode_json_path or os.path.join(worktree, "opencode.json"),
+    )
+    print(
+        f"Resolved project slug: {resolved_project} (mismatch={project_mismatch})",
+        file=sys.stderr,
+    )
+
     # --- Extract reasoning arcs (Path B input) ---
     arcs = extract_reasoning_chains(session)
     print(f"Extracted {len(arcs)} reasoning arcs", file=sys.stderr)
 
     # --- Classify both paths ---
     all_classifications = classify_multi(
-        client, model, session, arcs, skill_prompt, transcript_text
+        client,
+        model,
+        session,
+        arcs,
+        skill_prompt,
+        transcript_text,
+        project_hint=resolved_project,
     )
+
+    # Override project field on all results — config+Omnisearch is authoritative
+    if resolved_project != "unknown":
+        for c in all_classifications:
+            c.project = resolved_project
 
     if not all_classifications:
         append_log(
@@ -1716,5 +1738,8 @@ if __name__ == "__main__":
             pass
 
     status = "written" if written_paths else "skipped"
-    print(json.dumps({"status": status, "paths": written_paths}))
+    output = {"status": status, "paths": written_paths}
+    if project_mismatch:
+        output["project_mismatch"] = project_mismatch
+    print(json.dumps(output))
     sys.exit(0)
