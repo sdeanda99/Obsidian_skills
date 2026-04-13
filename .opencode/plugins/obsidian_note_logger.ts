@@ -187,7 +187,8 @@ export const ObsidianNoteLoggerPlugin = async (
       }
 
       try {
-        const proc = await $`python3 ${SCRIPT} ${transcriptPath} ${configPath} ${worktree}`.nothrow()
+        const opencodeJsonPath = resolve(directory, "opencode.json")
+      const proc = await $`python3 ${SCRIPT} ${transcriptPath} ${configPath} ${worktree} ${opencodeJsonPath}`.nothrow()
         const stdout = proc.stdout.toString().trim()
         const stderr = proc.stderr.toString().trim()
 
@@ -205,6 +206,15 @@ export const ObsidianNoteLoggerPlugin = async (
           await client.tui.showToast({
             body: { message: label, variant: "success" },
           })
+          // Show mismatch warning as a separate toast so user sees both
+          if (parsed.project_mismatch) {
+            await client.tui.showToast({
+              body: {
+                message: `Project slug corrected: ${parsed.project_mismatch.from} → ${parsed.project_mismatch.to} (saved to config)`,
+                variant: "warning",
+              },
+            })
+          }
         }
         // "skipped" status: no toast per spec
 
