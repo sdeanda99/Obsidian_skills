@@ -788,6 +788,123 @@ Skip (should_capture: false) if: purely exploratory with no outcome, trivial/rea
     )
 
 
+def _moc_path_to_slug(path: str) -> str:
+    """
+    Convert a MOC vault path to a kebab-case project slug.
+    e.g. "Projects/ObsidianNoteLogger-MOC.md" -> "obsidian-note-logger"
+    """
+    import re as _re
+
+    stem = Path(path).stem  # "ObsidianNoteLogger-MOC"
+    stem = stem.replace("-MOC", "")  # "ObsidianNoteLogger"
+    # PascalCase -> kebab-case
+    slug = _re.sub(r"(?<!^)(?=[A-Z])", "-", stem).lower()
+    return slug
+
+
+def _save_project_to_config(opencode_json_path: str, slug: str) -> None:
+    """
+    Atomically update the 'project' field in the obsidian_note_logger
+    plugin config within opencode.json.
+    Reads the full file, modifies the project field, writes back atomically.
+    Silently does nothing on any error.
+    """
+    try:
+        raw = Path(opencode_json_path).read_text(encoding="utf-8")
+        data = json.loads(raw)
+        # Navigate plugin list: data["plugin"] is a list of [path, options] entries
+        for entry in data.get("plugin", []):
+            if isinstance(entry, list) and len(entry) >= 2:
+                opts = entry[1]
+                if "obsidian_note_logger" in opts:
+                    opts["obsidian_note_logger"]["project"] = slug
+                    break
+        Path(opencode_json_path).write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Saved project slug '{slug}' to {opencode_json_path}", file=sys.stderr)
+    except Exception as e:
+        print(f"Warning: could not save project slug to config: {e}", file=sys.stderr)
+
+
+def resolve_project_slug(
+    config: dict,
+    opencode_json_path: str,
+) -> tuple[str, "dict | None"]:
+    """
+    Resolve authoritative project slug from two sources:
+      1. config["project"]  -- explicit, from opencode.json
+      2. Omnisearch          -- search Projects/ for highest-scoring MOC
+
+    Reconciliation rules:
+      both match   -> return slug, mismatch=None
+      mismatch     -> use Omnisearch (vault truth), save to config, return mismatch info
+      config only  -> return config slug, mismatch=None
+      search only  -> save to config, return search slug, mismatch=None
+      neither      -> return "unknown", mismatch=None
+    """
+    config_slug = (config.get("project") or "").strip() or None
+
+    # Query Omnisearch for MOC files in Projects/ folder
+    omnisearch_slug = None
+    try:
+        encoded = urllib.parse.quote("MOC")
+        url = f"http://localhost:51361/search?q={encoded}"
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            if resp.status == 200:
+                results = json.loads(resp.read().decode())
+                moc_hits = [
+                    r
+                    for r in results
+                    if r.get("path", "").startswith("Projects/")
+                    and "-MOC" in r.get("path", "")
+                ]
+                if moc_hits:
+                    # Highest-scoring MOC = ground truth
+                    best = max(moc_hits, key=lambda r: r.get("score", 0))
+                    omnisearch_slug = _moc_path_to_slug(best["path"])
+                    print(
+                        f"Omnisearch MOC: {best['path']} -> slug: {omnisearch_slug}",
+                        file=sys.stderr,
+                    )
+    except Exception as e:
+        print(f"Omnisearch MOC lookup failed: {e}", file=sys.stderr)
+
+    # Reconcile
+    if config_slug and omnisearch_slug:
+        if config_slug == omnisearch_slug:
+            print(
+                f"Project slug resolved: {config_slug} (config + Omnisearch match)",
+                file=sys.stderr,
+            )
+            return config_slug, None
+        else:
+            mismatch = {"from": config_slug, "to": omnisearch_slug}
+            print(
+                f"Project slug MISMATCH: config={config_slug}, vault={omnisearch_slug} -> using vault",
+                file=sys.stderr,
+            )
+            _save_project_to_config(opencode_json_path, omnisearch_slug)
+            return omnisearch_slug, mismatch
+    elif config_slug:
+        print(f"Project slug resolved: {config_slug} (config only)", file=sys.stderr)
+        return config_slug, None
+    elif omnisearch_slug:
+        print(
+            f"Project slug resolved: {omnisearch_slug} (Omnisearch only, saving to config)",
+            file=sys.stderr,
+        )
+        _save_project_to_config(opencode_json_path, omnisearch_slug)
+        return omnisearch_slug, None
+    else:
+        print(
+            "Project slug: unknown (no config, no Omnisearch MOC found)",
+            file=sys.stderr,
+        )
+        return "unknown", None
+
+
 def classify_decisions_patterns(
     client, model: str, transcript: str, skill_prompt: str
 ) -> list[ClassifyResult]:
