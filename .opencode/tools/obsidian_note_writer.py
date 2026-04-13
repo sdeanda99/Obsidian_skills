@@ -906,7 +906,11 @@ def resolve_project_slug(
 
 
 def classify_decisions_patterns(
-    client, model: str, transcript: str, skill_prompt: str
+    client,
+    model: str,
+    transcript: str,
+    skill_prompt: str,
+    project_hint: str = "unknown",
 ) -> list[ClassifyResult]:
     """
     Path A: Classify the FULL session transcript for decisions, patterns, and learnings.
@@ -914,8 +918,31 @@ def classify_decisions_patterns(
     No cap on count; LLM decides how many distinct items exist.
     Does NOT look for problem-solution arcs — that is Path B's job.
     """
-    system = f"""{skill_prompt}
+    project_constraint = (
+        (
+            f"\nCRITICAL: The project slug for ALL notes from this session is EXACTLY: {project_hint}\n"
+            f'You MUST use this exact value for every "project" field. Do NOT guess or infer a different slug.\n'
+        )
+        if project_hint != "unknown"
+        else ""
+    )
 
+    note_type_guide = """
+Note type guide — be specific, use these examples:
+- "decision": A CHOICE was made between competing options.
+  e.g. "We chose Ollama over OpenRouter", "We decided to use MoE architecture",
+  "We picked temperature=0 for deterministic classification output"
+- "pattern": A REUSABLE approach emerged that applies beyond this session.
+  e.g. "Every time we spawn a subprocess we should...",
+  "The delimiter-based output format works whenever mixing JSON + long Markdown"
+- "learning": Something was DISCOVERED, CONFIRMED, or UNDERSTOOD — knowledge gain.
+  e.g. "Discovered nemotron returns empty content when prompt is terse",
+  "Found that OpenCode fires session.idle multiple times for the same session"
+
+DO NOT return note_type "problem-solution" — that is a separate classification path.
+"""
+
+    system = f"""{skill_prompt}{project_constraint}{note_type_guide}
 You are a classifier for a developer knowledge base.
 Analyze the FULL session transcript and identify ALL distinct decisions, patterns,
 and learnings worth capturing as separate Obsidian notes.
@@ -981,15 +1008,23 @@ Rules:
 
 
 def classify_arc(
-    client, model: str, arc_text: str, skill_prompt: str
+    client, model: str, arc_text: str, skill_prompt: str, project_hint: str = "unknown"
 ) -> "ClassifyResult | None":
     """
     Path B: Classify a single reasoning arc for problem-solution capture.
     Returns None if the arc is not specific enough to be worth preserving.
     note_type is always "problem-solution" — decisions/patterns are Path A's job.
     """
-    system = f"""{skill_prompt}
+    project_constraint = (
+        (
+            f"\nCRITICAL: The project slug for ALL notes from this session is EXACTLY: {project_hint}\n"
+            f'You MUST use this exact value for every "project" field. Do NOT guess or infer a different slug.\n'
+        )
+        if project_hint != "unknown"
+        else ""
+    )
 
+    system = f"""{skill_prompt}{project_constraint}
 You are a classifier for a developer knowledge base.
 Analyze this reasoning chain (error → fix sequence) and decide if the
 problem+solution pair is specific enough to save a future developer time.
@@ -1004,15 +1039,19 @@ Return a JSON object:
   "solutions": ["Exactly what fixed the problem (concise, 1-2 sentences)"]
 }}
 
-Capture (should_capture: true) if:
-- The error has a non-obvious root cause that took investigation to find
-- The fix is specific and actionable (not just "read the docs")
-- Another developer hitting the same error would benefit from this record
+A GOOD arc to capture looks like:
+- PROBLEM: Specific error message with a non-obvious root cause
+  e.g. "Unterminated string at line 18 char 1714" -> caused by max_tokens=500 truncation
+  e.g. "Expecting value: line 1 column 1" -> thinking model returned empty content field
+- SOLUTION: Specific, actionable fix that another developer could apply
+  e.g. "Bumped max_tokens 500->1000 in classify call"
+  e.g. "Added extract_response_content() fallback to reasoning field"
 
-Skip (should_capture: false) if:
-- The error is trivial (typo, obvious syntax error)
-- The fix was just "retry" with no insight gained
-- The arc is too vague to be actionable
+SKIP if:
+- Error is trivial (typo, missing import, obvious syntax error fixed in <2 steps)
+- Fix was just "retry" with no root cause investigation
+- Arc has fewer than 2 tool calls (too thin to be a real debugging arc)
+- The error and fix are self-evident — no investigation reasoning visible
 
 "problems" and "solutions" must be parallel lists (same length).
 """
@@ -1054,6 +1093,7 @@ def classify_multi(
     arcs: list,
     skill_prompt: str,
     transcript: str,
+    project_hint: str = "unknown",
 ) -> list:
     """
     Run both classification paths and return the combined list.
@@ -1069,7 +1109,9 @@ def classify_multi(
 
     # Path A: full log for decisions, patterns, learnings
     try:
-        path_a = classify_decisions_patterns(client, model, transcript, skill_prompt)
+        path_a = classify_decisions_patterns(
+            client, model, transcript, skill_prompt, project_hint
+        )
         results.extend(path_a)
         print(f"Path A: {len(path_a)} items classified", file=sys.stderr)
     except Exception as e:
@@ -1079,7 +1121,7 @@ def classify_multi(
     for arc in arcs:
         arc_text = format_arc(arc)
         try:
-            result = classify_arc(client, model, arc_text, skill_prompt)
+            result = classify_arc(client, model, arc_text, skill_prompt, project_hint)
             if result:
                 result._arc = arc
                 results.append(result)
