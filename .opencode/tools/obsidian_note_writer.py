@@ -831,23 +831,29 @@ def _save_project_to_config(opencode_json_path: str, slug: str) -> None:
 def resolve_project_slug(
     config: dict,
     opencode_json_path: str,
-) -> tuple[str, "dict | None"]:
+) -> tuple[str, None]:
     """
-    Resolve authoritative project slug from two sources:
-      1. config["project"]  -- explicit, from opencode.json
-      2. Omnisearch          -- search Projects/ for highest-scoring MOC
+    Config is the single source of truth for the project slug.
+    Omnisearch is used only to VALIDATE that the configured MOC exists in the
+    vault — it never overrides config and never auto-saves anything.
 
-    Reconciliation rules:
-      both match   -> return slug, mismatch=None
-      mismatch     -> use Omnisearch (vault truth), save to config, return mismatch info
-      config only  -> return config slug, mismatch=None
-      search only  -> save to config, return search slug, mismatch=None
-      neither      -> return "unknown", mismatch=None
+    If config["project"] is not set, warns and returns "unknown" so the caller
+    can bail early with a clear message directing the user to init-new-moc.
+    This prevents cross-repo contamination where a shared vault's highest-scoring
+    MOC would silently overwrite the config of an unrelated repo.
     """
     config_slug = (config.get("project") or "").strip() or None
 
-    # Query Omnisearch for MOC files in Projects/ folder
-    omnisearch_slug = None
+    if not config_slug:
+        print(
+            "WARNING: 'project' is not set in opencode.json plugin config. "
+            "Notes will still be written but MOC insert will be skipped. "
+            "Run the init-new-moc skill to configure this project.",
+            file=sys.stderr,
+        )
+        return "unknown", None
+
+    # Optional: validate MOC exists in vault (log only — never overrides config)
     try:
         encoded = urllib.parse.quote("MOC")
         url = f"http://localhost:51361/search?q={encoded}"
@@ -859,50 +865,26 @@ def resolve_project_slug(
                     for r in results
                     if r.get("path", "").startswith("Projects/")
                     and "-MOC" in r.get("path", "")
+                    and config_slug in _moc_path_to_slug(r.get("path", ""))
                 ]
                 if moc_hits:
-                    # Highest-scoring MOC = ground truth
-                    best = max(moc_hits, key=lambda r: r.get("score", 0))
-                    omnisearch_slug = _moc_path_to_slug(best["path"])
                     print(
-                        f"Omnisearch MOC: {best['path']} -> slug: {omnisearch_slug}",
+                        f"Project slug: {config_slug} ✓ (MOC confirmed in vault)",
                         file=sys.stderr,
                     )
-    except Exception as e:
-        print(f"Omnisearch MOC lookup failed: {e}", file=sys.stderr)
+                else:
+                    print(
+                        f"WARNING: No MOC found in vault for project '{config_slug}'. "
+                        "Run init-new-moc to create one.",
+                        file=sys.stderr,
+                    )
+    except Exception:
+        print(
+            f"Project slug: {config_slug} (Omnisearch unavailable — skipping MOC validation)",
+            file=sys.stderr,
+        )
 
-    # Reconcile
-    if config_slug and omnisearch_slug:
-        if config_slug == omnisearch_slug:
-            print(
-                f"Project slug resolved: {config_slug} (config + Omnisearch match)",
-                file=sys.stderr,
-            )
-            return config_slug, None
-        else:
-            mismatch = {"from": config_slug, "to": omnisearch_slug}
-            print(
-                f"Project slug MISMATCH: config={config_slug}, vault={omnisearch_slug} -> using vault",
-                file=sys.stderr,
-            )
-            _save_project_to_config(opencode_json_path, omnisearch_slug)
-            return omnisearch_slug, mismatch
-    elif config_slug:
-        print(f"Project slug resolved: {config_slug} (config only)", file=sys.stderr)
-        return config_slug, None
-    elif omnisearch_slug:
-        print(
-            f"Project slug resolved: {omnisearch_slug} (Omnisearch only, saving to config)",
-            file=sys.stderr,
-        )
-        _save_project_to_config(opencode_json_path, omnisearch_slug)
-        return omnisearch_slug, None
-    else:
-        print(
-            "Project slug: unknown (no config, no Omnisearch MOC found)",
-            file=sys.stderr,
-        )
-        return "unknown", None
+    return config_slug, None
 
 
 def classify_decisions_patterns(
@@ -1550,10 +1532,19 @@ if __name__ == "__main__":
         config,
         opencode_json_path or os.path.join(worktree, "opencode.json"),
     )
-    print(
-        f"Resolved project slug: {resolved_project} (mismatch={project_mismatch})",
-        file=sys.stderr,
-    )
+    print(f"Resolved project slug: {resolved_project}", file=sys.stderr)
+
+    if resolved_project == "unknown":
+        # No project configured — bail cleanly rather than writing notes with wrong slugs
+        print(
+            json.dumps(
+                {
+                    "status": "skipped",
+                    "reason": "project not configured — run init-new-moc skill",
+                }
+            )
+        )
+        sys.exit(0)
 
     # --- Extract reasoning arcs (Path B input) ---
     arcs = extract_reasoning_chains(session)
@@ -1738,8 +1729,5 @@ if __name__ == "__main__":
             pass
 
     status = "written" if written_paths else "skipped"
-    output = {"status": status, "paths": written_paths}
-    if project_mismatch:
-        output["project_mismatch"] = project_mismatch
-    print(json.dumps(output))
+    print(json.dumps({"status": status, "paths": written_paths}))
     sys.exit(0)

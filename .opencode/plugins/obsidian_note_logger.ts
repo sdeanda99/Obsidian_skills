@@ -206,15 +206,6 @@ export const ObsidianNoteLoggerPlugin = async (
           await client.tui.showToast({
             body: { message: label, variant: "success" },
           })
-          // Show mismatch warning as a separate toast so user sees both
-          if (parsed.project_mismatch) {
-            await client.tui.showToast({
-              body: {
-                message: `Project slug corrected: ${parsed.project_mismatch.from} → ${parsed.project_mismatch.to} (saved to config)`,
-                variant: "warning",
-              },
-            })
-          }
         }
         // "skipped" status: no toast per spec
 
