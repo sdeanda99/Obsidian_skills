@@ -4,9 +4,10 @@ description: >
   Use when the user wants to start a new project with the obsidian_note_logger
   pipeline. Triggers: "new project", "init project", "create MOC", "setup new
   project", "start tracking a new project", "configure for new project",
-  "new moc", "initialize project". Walks the user through inference provider
-  selection (OpenRouter or Ollama), all plugin config fields in opencode.json,
-  creates the project MOC in Obsidian, and verifies the full pipeline is healthy.
+  "new moc", "initialize project". Walks the user through install level
+  selection (project or global), inference provider selection (OpenRouter or
+  Ollama), all plugin config fields in opencode.json, creates the project MOC
+  in Obsidian, and verifies the full pipeline is healthy.
 compatibility: opencode
 license: MIT
 ---
@@ -14,8 +15,8 @@ license: MIT
 # Init New MOC
 
 Guided setup wizard for starting a new project with the `obsidian_note_logger`
-pipeline. Walks the user through every config field, creates the project MOC,
-and verifies the full pipeline is healthy before finishing.
+pipeline. Walks the user through install level, every config field, creates the
+project MOC, and verifies the full pipeline is healthy before finishing.
 
 ---
 
@@ -23,12 +24,82 @@ and verifies the full pipeline is healthy before finishing.
 
 When a user starts a new project, this skill:
 
-1. Collects project identity (name → kebab slug, vault)
-2. Asks the user to choose an inference provider (OpenRouter or Ollama)
-3. Walks through session capture thresholds and notification preferences
-4. Verifies the full pipeline — Ollama, Omnisearch, vault, model, Modelfile sync
-5. Creates the project MOC in Obsidian using `obsidian_createNote`
-6. Previews config diff and writes `opencode.json` atomically on confirm
+1. Asks where to install (project-level or global)
+2. Collects project identity (name → kebab slug, vault)
+3. Asks the user to choose an inference provider (OpenRouter or Ollama)
+4. Walks through session capture thresholds and notification preferences
+5. Verifies the full pipeline — Ollama, Omnisearch, vault, model, Modelfile sync
+6. Creates the project MOC in Obsidian using `obsidian_createNote`
+7. Previews config diff and writes the target `opencode.json` atomically on confirm
+
+---
+
+## Stage 0: Install Level
+
+Before anything else, ask the user where to install:
+
+```
+Where do you want to install the obsidian_note_logger plugin?
+
+A) Project-level (recommended for first-time setup)
+   Config lives in THIS repo's opencode.json
+   Best for: different vault/model/project settings per repo
+   Config file: <current-working-dir>/opencode.json
+
+B) Global
+   Plugin available in ALL repos on this machine
+   Best for: one vault across all projects, configure once
+   Config file: ~/.config/opencode/opencode.json
+   Note: each project repo will still need a minimal opencode.json
+         with just "project" (and optionally "vault") to identify itself
+```
+
+**If Project-level (A):**
+- Target config file: `<worktree>/opencode.json`
+- Plugin path in config: `.opencode/plugins/obsidian_note_logger.ts`
+- Proceed directly to Stage 1
+
+**If Global (B):**
+- Check if plugin file exists at `~/.config/opencode/plugins/obsidian_note_logger.ts`
+- If NOT found, show these copy commands and ask user to run them, then confirm:
+  ```bash
+  mkdir -p ~/.config/opencode/plugins \
+            ~/.config/opencode/tools \
+            ~/.config/opencode/tools/Modelfiles \
+            ~/.config/opencode/agents
+  cp .opencode/plugins/obsidian_note_logger.ts ~/.config/opencode/plugins/
+  cp .opencode/tools/obsidian_note_writer.py ~/.config/opencode/tools/
+  cp .opencode/tools/Modelfiles/*.Modelfile ~/.config/opencode/tools/Modelfiles/
+  cp .opencode/agents/notedrift.md ~/.config/opencode/agents/
+  cp -r .opencode/skills/ ~/.config/opencode/skills/
+  ```
+  Wait for user to confirm files are copied before continuing.
+- Target config file: `~/.config/opencode/opencode.json`
+- Plugin path in config: `~/.config/opencode/plugins/obsidian_note_logger.ts`
+- Proceed to Stage 1
+
+**After Stage 7 (config write), if Global was chosen, show this message:**
+```
+Global install complete!
+
+For each new project repo, run init-new-moc in that repo, OR create a minimal
+opencode.json in the project root with just the project-specific overrides:
+
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [[
+    "~/.config/opencode/plugins/obsidian_note_logger.ts",
+    {
+      "obsidian_note_logger": {
+        "project": "your-project-slug",
+        "vault": "YourVault"
+      }
+    }
+  ]]
+}
+
+Restart the OpenCode server to pick up the new global plugin config.
+```
 
 ---
 
@@ -40,10 +111,10 @@ Ask the user:
    - Derive kebab slug automatically: `my-auth-service`
    - Show derived slug and ask: "Does this slug look right, or would you like to customize it?"
 
-2. **Vault name** — show current value from `opencode.json`:
+2. **Vault name** — show current value from target config (or null if not set):
    ```
-   Current vault: Diddys_Diaries
-   Press Enter to keep, or type a new vault name:
+   Current vault: null (not set)
+   Enter your Obsidian vault name (the directory name of your vault):
    ```
 
 3. **One-sentence overview** — used for the MOC Overview section
@@ -127,12 +198,12 @@ Report pass ✅ / warn ⚠ / fail ❌ for each:
 - ❌ Fail → ask user to confirm correct vault name before continuing
 
 ### 5b: Omnisearch reachable
-- Use `omnisearch_search({ query: "test" })`
-- ✅ Returns results → Omnisearch up, dedup search will work
+- Use `omnisearch_search({ query: "test", limit: 1 })`
+- ✅ Returns → Omnisearch up, dedup search will work
 - ⚠ Fails → "Omnisearch unavailable — dedup search will be skipped, notes will still be written"
 
 ### 5c: Existing MOC check
-- Use `omnisearch_search({ query: "<project-name> MOC" })` — look for hits in `Projects/`
+- Use `omnisearch_search({ query: "<project-name> MOC", limit: 5 })` — look for hits in `Projects/`
 - If found → "A MOC already exists at `Projects/<Name>-MOC.md`. Use existing or create new?"
 - If not found → proceed to create
 
@@ -142,23 +213,22 @@ curl -s http://localhost:11434/api/tags
 ```
 - ❌ Not reachable → "Ollama is not running. Start it with `ollama serve` before continuing."
 - ✅ Reachable → check if `notetaker` model exists in response
-  - ❌ Missing → "Run: `ollama create notetaker -f .opencode/tools/Modelfiles/notetaker.Modelfile`"
+  - ❌ Missing → show: `ollama create notetaker -f .opencode/tools/Modelfiles/notetaker.Modelfile`
   - ✅ Exists → pass
 
 ### 5e: Modelfile context limit sync (only if Ollama chosen)
-Read `.opencode/tools/Modelfiles/notetaker.Modelfile` and extract `num_ctx`.
-Compare against `provider.ollama.models.notetaker.limit.context` in `opencode.json`.
-- ⚠ Mismatch → "Modelfile num_ctx=250000 but opencode.json limit.context=131072.
-  Will update opencode.json to match during config write."
+Read `.opencode/tools/Modelfiles/notetaker.Modelfile` (or `~/.config/opencode/tools/Modelfiles/notetaker.Modelfile` for global install).
+Extract `num_ctx` value. Compare against target config's `provider.ollama.models.notetaker.limit.context`.
+- ⚠ Mismatch → "Will update opencode.json limit.context to match Modelfile during config write."
 
 ### 5f: OpenRouter key check (only if OpenRouter chosen)
-Read `~/.local/share/opencode/auth.json` and check `openrouter.key` is present.
+Read `~/.local/share/opencode/auth.json` and check `openrouter.key` is present and non-empty.
 - ❌ Missing → "No OpenRouter key found. Run `/connect` in the OpenCode TUI and select OpenRouter."
 - ✅ Present → show masked: `sk-or-...XXXX` → pass
 
 ### 5g: note_skill exists
-Check `.opencode/skills/obsidian-dev-notes/SKILL.md` (or whatever `note_skill` is set to).
-- ⚠ Missing → "note_skill not found — note generation may use default style"
+Check that `.opencode/skills/obsidian-dev-notes/SKILL.md` (or global equivalent) exists.
+- ⚠ Missing → "note_skill 'obsidian-dev-notes' not found — note generation may use default style"
 
 ---
 
@@ -212,10 +282,10 @@ Confirm: "MOC created at `Projects/<PascalName>-MOC.md`"
 
 ## Stage 7: Config Preview + Write
 
-Show a summary of what will be written:
+Show a summary of what will be written to the target config file:
 
 ```
-The following changes will be saved to opencode.json:
+The following will be saved to <target-config-file>:
 
   project:        <new-slug>
   vault:          <vault>
@@ -233,28 +303,31 @@ The following changes will be saved to opencode.json:
 Save these settings? (yes / no / edit)
 ```
 
-On **yes**: write `opencode.json` atomically
-- Read full file → update `plugin[0][1].obsidian_note_logger` fields
-- If 5e Modelfile mismatch detected: also update
-  `provider.ollama.models.notetaker.limit.context` and
-  `provider.ollama.models.note-drift.limit.context` to match Modelfile value
-- Write back with `json.dumps(indent=2)` + trailing newline
+On **yes**: write target config atomically
+- **Project-level:** read `<worktree>/opencode.json` → update `plugin[0][1].obsidian_note_logger` fields → write back with `json.dumps(indent=2)` + newline
+- **Global:** read `~/.config/opencode/opencode.json` → update/add `plugin` block and `provider.ollama` block (if Ollama chosen) → write back with `json.dumps(indent=2)` + newline
+- If 5e Modelfile mismatch: also update `provider.ollama.models.notetaker.limit.context` and `provider.ollama.models.note-drift.limit.context`
 
 On **no**: abort — tell user no files were modified.
 
 On **edit**: ask which stage to return to, loop back, re-run verification.
+
+**After writing**, remind: "Restart the OpenCode server to pick up the new plugin config."
+
+If Global install was chosen, show the per-project override snippet from Stage 0.
 
 ---
 
 ## Config Field Reference
 
 ```
-project          → kebab-case slug; routes notes to the correct MOC in Obsidian
-vault            → name of your Obsidian vault directory
-base_url         → LLM endpoint (OpenRouter: https://openrouter.ai/api/v1/ | Ollama: http://localhost:11434/v1)
-api_key          → "ollama" for local inference, null to auto-read from auth.json for cloud
+project          → kebab-case slug matching your MOC filename prefix (e.g. obsidian-note-logger)
+                   null = pipeline bails with prompt to run init-new-moc
+vault            → name of your Obsidian vault directory (e.g. Diddys_Diaries)
+base_url         → LLM endpoint: https://openrouter.ai/api/v1/ or http://localhost:11434/v1
+api_key          → "ollama" for local, null to auto-read from auth.json for cloud
 model            → LLM model name sent to the API
-ollama_model     → Ollama model alias (only used when base_url is localhost:11434)
+ollama_model     → Ollama model alias (only used when base_url contains localhost:11434)
 min_tool_calls   → minimum tool calls a session needs before the pipeline fires
 min_messages     → minimum messages a session needs before the pipeline fires
 log_enabled      → write an audit entry to wiki/log.md after every note written
@@ -273,5 +346,5 @@ note_skill       → which skill teaches the LLM note format (default: obsidian-
 - Ollama checks (5d, 5e) are skipped entirely if OpenRouter is chosen in Stage 2
 - OpenRouter check (5f) is skipped entirely if Ollama is chosen
 - MOC is created before config is written — if config write fails, MOC still exists
-- After saving config, remind the user: **"Restart the OpenCode server to pick up the new plugin config"**
+- After saving config, always remind: **"Restart the OpenCode server to pick up the new plugin config"**
 - Run `@notedrift` after setup to link the new MOC into the vault graph

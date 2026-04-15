@@ -1,337 +1,283 @@
-# Obsidian Skills for OpenCode
+# obsidian_note_logger
 
-OpenCode skills and tools for seamless Obsidian integration. This repository provides AI
-agents with the ability to interact with your Obsidian vault through the native CLI and
-search capabilities.
+Autonomous OpenCode plugin that captures Decisions, Patterns, Learnings, and Problem-Solutions from your development sessions directly into Obsidian — zero manual effort required.
 
-## Features
+After every substantive OpenCode session, the plugin fires two LLM classification passes over your session history and writes structured, cross-linked notes to your vault following the `obsidian-dev-notes` schema.
 
-- **Obsidian CLI Skill** — General-purpose vault management via the native Obsidian CLI
-- **Obsidian Dev Notes Skill** — Structured developer knowledge with MOCs, decisions, patterns
-- **Omnisearch Custom Tool** — Fast, fuzzy vault search with result excerpts
-- **Obsidian CLI Tool** — Typed TypeScript wrapper for vault CRUD, properties, tasks, and links
+---
 
-## obsidian_note_logger Plugin
+## How It Works
 
-Automatically captures Decisions and Patterns from your OpenCode sessions into Obsidian.
-After every substantive session (filtered by threshold + LLM classification), a structured
-note is written to your vault following the `obsidian-dev-notes` schema.
+1. **Accumulate** — the plugin records every tool call and message during the session
+2. **Threshold check** — on `session.idle`, filters sessions below `min_tool_calls` / `min_messages`
+3. **Path A** — full session transcript sent to LLM → identifies all distinct decisions, patterns, and learnings (no cap on count)
+4. **Path B** — session timeline scanned for error→fix reasoning arcs → each arc classified as a problem-solution note
+5. **Generate** — each classification produces a structured Obsidian note with git commit references from the session
+6. **Write** — notes written to vault (`Decisions/`, `Patterns/`, `Learnings/`), wikilinks inserted into the project MOC
+7. **Notify** — TUI toast + audit log entry in `wiki/log.md`
 
-### How It Works
+### Skills & Agents
 
-1. The plugin accumulates all tool calls and messages during a session
-2. Only context since the last Obsidian vault interaction is sent to the LLM (delta capture)
-3. When the agent goes idle (`session.idle`), it checks if the session was substantive
-   (configurable threshold: min tool calls + min messages)
-4. A lightweight LLM call classifies whether a Decision or Pattern is worth capturing
-   and extracts the project name and key topics
-5. Omnisearch is queried for related existing notes — if found, the LLM decides whether
-   to enrich an existing note or create a new one (dedup check)
-6. The note is written to your Obsidian vault via the CLI, and linked into your project MOC
-7. A toast notification confirms the write; transactions are logged to `wiki/log.md`
-
-### Installation
-
-The plugin is already in `.opencode/plugins/obsidian_note_logger.ts`.
-Install the `openai` Python dependency:
-
-```bash
-pip install openai>=1.0.0
-# or
-uv pip install openai>=1.0.0
-```
-
-Then configure the model in `opencode.json` (see examples below).
-
-### Configuration Examples
-
-**Default — inherits the same model as your main OpenCode session:**
-
-```jsonc
-"obsidian_note_logger": {
-  "model": null,
-  "base_url": null,
-  "api_key": null
-}
-```
-
-**Local AI with Ollama (no API costs, fully private):**
-
-```jsonc
-"obsidian_note_logger": {
-  "model": "llama3.2",
-  "base_url": "http://localhost:11434/v1",
-  "api_key": "ollama"
-}
-```
-
-Requires Ollama running locally: `ollama serve` and `ollama pull llama3.2`.
-
-**Smaller cloud model — Anthropic Haiku (fast and cheap):**
-
-```jsonc
-"obsidian_note_logger": {
-  "model": "claude-haiku-4-5",
-  "base_url": null,
-  "api_key": null
-}
-```
-
-Uses `ANTHROPIC_API_KEY` from your environment automatically.
-
-### Full Config Reference
-
-```jsonc
-"obsidian_note_logger": {
-  // LLM config
-  "model": null,           // null = inherit OPENCODE_MODEL env → fallback claude-haiku-4-5
-  "base_url": null,        // null = cloud; "http://localhost:11434/v1" = Ollama
-  "api_key": null,         // null = inherit ANTHROPIC_API_KEY / OPENAI_API_KEY from env
-
-  // Vault
-  "vault": null,           // null = active vault; "My Vault" = specific vault name
-  "note_skill": "obsidian-dev-notes",  // skill schema governing note structure
-
-  // Filtering (sessions below these thresholds are silently ignored)
-  "min_tool_calls": 2,
-  "min_messages": 3,
-
-  // Transaction log
-  "log_path": "wiki/log.md",   // vault-relative path
-  "log_enabled": true,
-
-  // Notifications
-  "toast_enabled": true,        // in-app TUI toast
-  "os_notify": false            // OS-level notify-send / osascript
-}
-```
+| Name | Trigger | What it does |
+|---|---|---|
+| `init-new-moc` | "new project", "init project", "create MOC" | Guided setup wizard — install level, provider, config, MOC creation, verification |
+| `@notedrift` | "realign my notes", "update MOC", "note drift" | Realigns project MOC, enriches cross-links between notes |
+| `obsidian-dev-notes` | "document this decision", "capture this pattern" | Note structure and vault management |
 
 ---
 
 ## Prerequisites
 
-### Required Software
+| Requirement | Notes |
+|---|---|
+| [Obsidian](https://obsidian.md/) 1.12+ | Desktop app, installer version |
+| Obsidian CLI | Enable: Settings → General → Command line interface → toggle on |
+| [Omnisearch plugin](https://github.com/scambier/obsidian-omnisearch) | Enable HTTP Server in Omnisearch settings (port 51361) |
+| Python 3.10+ | For the note writer worker |
+| `openai>=1.0.0` | `pip install openai>=1.0.0` |
+| Bun | For running TypeScript tools |
+| Ollama (optional) | For local inference — `ollama serve` |
 
-- **Obsidian** (desktop app, installer version **1.12.7 or later**)
-- **Bun** (for running TypeScript tools)
-- **Python** 3.10+ (for package install)
-
-### Required Setup
-
-1. **Obsidian CLI** — Enable in Obsidian: Settings → General → Command line interface → toggle on.
-   Restart your terminal after registration. Verify with `obsidian version`.
-
-2. **Omnisearch plugin** — Install from Community Plugins. Enable HTTP Server in Omnisearch
-   settings (runs on port 51361).
-
-See `obsidian-cli/references/setup.md` for platform-specific CLI setup (Linux, macOS, Windows).
+---
 
 ## Installation
 
-### 1. Clone the Repository
+### Option A: Project-level (recommended for first setup)
+
+Plugin config lives in your project's `opencode.json`. Each project has its own vault and model settings.
 
 ```bash
 git clone https://github.com/sdeanda99/Obsidian_skills.git
 cd Obsidian_skills
+pip install openai>=1.0.0
 ```
 
-### 2. Install Python Dependencies
+Then run `init-new-moc` from any OpenCode session in your project:
 
-**Option A: Using `uv` (recommended)**
+```
+"new project"   or   "init project"   or   "create MOC"
+```
+
+The wizard handles everything else.
+
+### Option B: Global install
+
+Plugin available in all repos on your machine. Each project adds a minimal `opencode.json` override with just `project` and optionally `vault`.
 
 ```bash
-uv pip install -e .
+git clone https://github.com/sdeanda99/Obsidian_skills.git
+cd Obsidian_skills
+
+# Copy plugin files to global OpenCode config
+mkdir -p ~/.config/opencode/plugins \
+          ~/.config/opencode/tools \
+          ~/.config/opencode/tools/Modelfiles \
+          ~/.config/opencode/agents
+
+cp .opencode/plugins/obsidian_note_logger.ts ~/.config/opencode/plugins/
+cp .opencode/tools/obsidian_note_writer.py   ~/.config/opencode/tools/
+cp .opencode/tools/Modelfiles/*.Modelfile    ~/.config/opencode/tools/Modelfiles/
+cp .opencode/agents/notedrift.md             ~/.config/opencode/agents/
+cp -r .opencode/skills/                      ~/.config/opencode/skills/
+
+pip install openai>=1.0.0
 ```
 
-**Option B: Using standard `pip`**
+Then run `init-new-moc` — choose **Global** when prompted for install level.
 
+**Per-project override** (in each new project's `opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [[
+    "~/.config/opencode/plugins/obsidian_note_logger.ts",
+    {
+      "obsidian_note_logger": {
+        "project": "your-project-slug",
+        "vault": "YourVault"
+      }
+    }
+  ]]
+}
+```
+
+Or just run `init-new-moc` in each new project repo — it creates this file for you.
+
+---
+
+## First-Time Setup
+
+Run from any OpenCode session:
+
+```
+"new project"
+```
+
+The `init-new-moc` wizard walks you through:
+
+1. **Install level** — project-level or global
+2. **Project identity** — name → kebab slug, vault name, one-sentence overview, domain tags
+3. **Inference provider** — OpenRouter (cloud) or Ollama (local)
+4. **Thresholds** — `min_tool_calls`, `min_messages`
+5. **Notifications** — toasts, OS notify, audit log
+6. **Verification** — vault, Omnisearch, Ollama models, OpenRouter key, Modelfile context sync
+7. **MOC creation** — writes `Projects/<ProjectName>-MOC.md` to Obsidian
+8. **Config write** — previews changes, writes `opencode.json` atomically on confirm
+
+---
+
+## Inference Providers
+
+### OpenRouter (cloud)
+
+Uses your OpenRouter API key automatically from `~/.local/share/opencode/auth.json`.
+
+```json
+{
+  "obsidian_note_logger": {
+    "base_url": "https://openrouter.ai/api/v1/",
+    "api_key": null,
+    "model": "anthropic/claude-haiku-4-5",
+    "ollama_model": null
+  }
+}
+```
+
+Set up your key: run `/connect` in the OpenCode TUI and select OpenRouter.
+
+### Ollama (local — fully private, no API costs)
+
+Requires Ollama running with the custom `notetaker` and `note-drift` models.
+
+**1. Pull the base model:**
 ```bash
-pip install -r requirements.txt
+ollama pull nemotron-cascade-2:latest
 ```
 
-### 3. Deploy Skills and Tools
-
-Copy skills and tools to your OpenCode configuration:
-
+**2. Create custom models from Modelfiles:**
 ```bash
-# Skills
-cp -r obsidian-cli ~/.claude/skills/
-cp -r obsidian-dev-notes ~/.claude/skills/
-
-# Tools
-cp tools/omnisearch.ts ~/.claude/tools/
-cp tools/obsidian.ts ~/.claude/tools/
+ollama create notetaker   -f .opencode/tools/Modelfiles/notetaker.Modelfile
+ollama create note-drift  -f .opencode/tools/Modelfiles/notedrift.Modelfile
 ```
 
-Restart OpenCode to load the new skills and tools.
+Both models use **250K context window** and are tuned for structured JSON classification.
 
-## Quick Start
-
-### Using the Obsidian CLI Skill
-
-The skill loads when you mention vault operations:
-
-```
-"Create a new note called 'Meeting Notes' with today's date"
-"Update the status property on my Project MOC"
-"List all tasks in my Projects folder"
-"Find orphaned notes in my vault"
-```
-
-### Using the Dev Notes Skill
-
-Structured knowledge management triggers:
-
-```
-"Start a new project hub for my authentication refactor"
-"Document the decision to use JWT tokens"
-"Capture the retry pattern I just implemented"
-"Run my weekly review"
+**3. Configure:**
+```json
+{
+  "obsidian_note_logger": {
+    "base_url": "http://localhost:11434/v1",
+    "api_key": "ollama",
+    "model": "notetaker",
+    "ollama_model": "notetaker"
+  }
+}
 ```
 
-### Using the Omnisearch Tool
+---
 
-Search your vault for specific content:
+## Full Config Reference
 
+```jsonc
+{
+  "obsidian_note_logger": {
+
+    // Project identity
+    // null = pipeline bails cleanly with prompt to run init-new-moc
+    "project": null,           // kebab-case slug matching your MOC filename prefix
+    "vault": null,             // Obsidian vault directory name
+
+    // LLM inference — configure via init-new-moc or manually
+    "model": null,             // null = auto-detect from provider
+    "base_url": null,          // null = OpenRouter; "http://localhost:11434/v1" = Ollama
+    "api_key": null,           // null = auto-read from auth.json; "ollama" for local
+    "ollama_model": null,      // Ollama model alias (used when base_url = localhost:11434)
+
+    // Note style
+    "note_skill": "obsidian-dev-notes",  // skill defining note structure and schema
+
+    // Session thresholds — sessions below these are silently ignored
+    "min_tool_calls": 10,      // minimum tool calls before pipeline fires
+    "min_messages": 8,         // minimum messages before pipeline fires
+
+    // Audit log
+    "log_enabled": true,       // write entry to vault after each note written
+    "log_path": "wiki/log.md", // vault-relative path for audit log
+
+    // Notifications
+    "toast_enabled": true,     // TUI toast on note written / error
+    "os_notify": true          // OS desktop notification after note written
+  }
+}
 ```
-"Search my vault for 'machine learning' notes"
-"Find all notes mentioning 'project deadline'"
-```
 
-Test the Omnisearch endpoint directly:
+---
 
-```bash
-curl "http://localhost:51361/search?q=test"
-```
+## Agents
 
-## Available Tools & Skills
+### `@notedrift`
 
-### 1. Obsidian CLI Skill
+Realigns your project MOC and enriches cross-links between related notes.
 
-**Location:** `obsidian-cli/`
+**Invoke:** say "realign my notes", "update MOC", or "fix note drift"
 
-**Capabilities:**
-- Create, read, append, delete notes
-- Manage frontmatter properties (set, read, remove, list)
-- Query tasks and toggle completion
-- List tags vault-wide or per-note
-- Find backlinks and orphaned notes
-- Interact with daily notes
-- Run arbitrary JavaScript in Obsidian context (eval escape hatch)
+**What it does:**
+- Adds missing wikilinks to the project MOC under correct headings
+- Enriches cross-links between the top 5 most related note pairs
+- Updates the MOC `updated` frontmatter date
+- May rewrite the MOC Overview if clearly outdated
 
-**Documentation:**
-- `obsidian-cli/SKILL.md` — Main skill guide and heading-insert pattern
-- `obsidian-cli/references/cli_reference.md` — Condensed command reference
-- `obsidian-cli/references/setup.md` — Platform-specific setup
+**What it does NOT do:** create new notes, delete anything, rewrite entire note bodies
 
-### 2. Obsidian Developer Notes Skill
-
-**Location:** `obsidian-dev-notes/`
-
-**Capabilities:**
-- Create and maintain project MOCs (Maps of Content)
-- Document architectural decisions with context and trade-offs
-- Capture reusable patterns linked to projects
-- Record learnings and insights with typed frontmatter
-- Weekly review workflow with orphan detection and daily note processing
-- Task-driven project tracking per MOC
-- Raw source ingestion (Karpathy mode or direct typed notes)
-
-**Documentation:**
-- `obsidian-dev-notes/SKILL.md` — Full workflow guide
-- `obsidian-dev-notes/references/karpathy-ingest.md` — Raw ingestion workflow
-
-### 3. Obsidian CLI Tool
-
-**Location:** `tools/obsidian.ts`
-
-**Exports (17):** `createNote`, `readNote`, `appendToNote`, `deleteNote`, `listFiles`,
-`setProperty`, `readProperty`, `removeProperty`, `listProperties`, `listTags`,
-`listTasks`, `toggleTask`, `getBacklinks`, `getOrphans`, `readDailyNote`,
-`appendToDailyNote`, `evalJs`
-
-### 4. Omnisearch Custom Tool
-
-**Location:** `tools/omnisearch.ts`
-
-**Capabilities:**
-- Full-text fuzzy search across your vault
-- Returns scored results with excerpts and found words
-- Configurable result limits
-
-**Documentation:**
-- `docs/OMNISEARCH_TOOL.md` — Comprehensive tool guide
-- `docs/omnisearch.md` — Quick reference
-
-## Configuration
-
-### Default Service Ports
-
-- **Obsidian CLI:** No port — communicates directly with the running Obsidian app
-- **Omnisearch HTTP API:** `http://localhost:51361`
-
-No API keys or `.env` file required for CLI operations.
+---
 
 ## Troubleshooting
 
-### Obsidian CLI Not Found
+| Symptom | Fix |
+|---|---|
+| `project not configured — run init-new-moc` | Run `init-new-moc` skill to set the project slug |
+| Notes writing to wrong MOC | Check `project` field in `opencode.json` matches your MOC filename prefix |
+| Pipeline never fires | Lower `min_tool_calls`/`min_messages`, or check `wiki/log.md` for skipped entries |
+| `LLM classification failed` | Check Ollama is running (`ollama serve`) or OpenRouter key is set |
+| `notetaker` model not found | Run `ollama create notetaker -f .opencode/tools/Modelfiles/notetaker.Modelfile` |
+| Omnisearch unavailable | Enable HTTP Server in Obsidian → Settings → Omnisearch |
+| MOC insert always fails | Confirm `project` slug matches the MOC filename (e.g. `my-project` → `Projects/MyProject-MOC.md`) |
+| Notes not appearing in Obsidian | Check `vault` field matches your vault directory name exactly |
 
-```bash
-obsidian version
-# If "command not found":
+---
+
+## Repository Structure
+
+```
+.opencode/
+├── plugins/
+│   └── obsidian_note_logger.ts     # OpenCode plugin — session accumulator, idle trigger
+├── tools/
+│   ├── obsidian_note_writer.py     # Python worker — classification, generation, vault write
+│   └── Modelfiles/
+│       ├── notetaker.Modelfile     # nemotron-cascade-2, 250K ctx, temp=0
+│       └── notedrift.Modelfile     # nemotron-cascade-2, 250K ctx, temp=0.2
+├── agents/
+│   └── notedrift.md                # @notedrift subagent definition
+└── skills/
+    ├── init-new-moc/               # Setup wizard skill
+    ├── notedrift/                  # NoteDrift invocation skill
+    └── obsidian-dev-notes/         # Note structure and vault management skill
+
+tools/
+├── obsidian.ts                     # OpenCode custom tool — vault CRUD (17 exports)
+└── omnisearch.ts                   # OpenCode custom tool — fuzzy vault search
+
+obsidian-cli/                       # Skill: general-purpose vault management
+obsidian-dev-notes/                 # Skill: structured developer knowledge
 ```
 
-1. Verify Obsidian CLI is enabled: Settings → General → Command line interface
-2. Restart your terminal (PATH changes require a new session)
-3. See `obsidian-cli/references/setup.md` for platform-specific fixes
-
-### Obsidian CLI Not Responding
-
-- Ensure Obsidian is running (the CLI requires the app to be open)
-- Try `obsidian version` — if it hangs, restart Obsidian
-
-### Omnisearch Not Finding Results
-
-1. Check HTTP server is enabled: Obsidian → Settings → Omnisearch → Enable HTTP Server
-2. Try searching in Obsidian UI first (confirms the plugin is working)
-3. Test the endpoint:
-   ```bash
-   curl "http://localhost:51361/search?q=test"
-   ```
-
-## Documentation
-
-Additional documentation:
-
-- `docs/` — General documentation and guides
-- `obsidian-cli/references/` — CLI command reference and setup
-- `docs/archive/obsidian-rest-api/` — Archived REST API skill (reference only)
-- `docs/superpowers/` — Design specs and implementation plans
-
-## Contributing
-
-Contributions are welcome! Please ensure:
-
-1. Code follows existing style conventions
-2. Documentation is updated for new features
-3. Skills include clear "when to use" descriptions in frontmatter
-4. Tools have comprehensive error handling (all errors returned as JSON, never thrown)
+---
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- [Obsidian](https://obsidian.md/) — The knowledge base application
-- [Obsidian CLI](https://obsidian.md/help/cli) — Native CLI (Obsidian 1.12+)
-- [Omnisearch Plugin](https://github.com/scambier/obsidian-omnisearch) — Search capabilities
-
-## Version
-
-**Current Version:** 2.0.0
-
----
+Apache License 2.0 — see [LICENSE](LICENSE)
 
 **Author:** Sebastian De Anda
 **Repository:** https://github.com/sdeanda99/Obsidian_skills
