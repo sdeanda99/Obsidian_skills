@@ -45,24 +45,40 @@ interface NoteLoggerConfig {
 // OpenCode does NOT pass plugin tuple options to local file plugins (options arg is always {}).
 // Read config directly from opencode.json in the project directory instead.
 
-function loadConfig(directory: string): NoteLoggerConfig {
-  let raw: Partial<NoteLoggerConfig> = {}
+function readPluginConfig(configPath: string): Partial<NoteLoggerConfig> {
   try {
-    const configPath = resolve(directory, "opencode.json")
     const json = JSON.parse(readFileSync(configPath, "utf8"))
-    // Find our plugin tuple: ["path", { obsidian_note_logger: {...} }]
     const plugins: unknown[] = json.plugin ?? []
     for (const entry of plugins) {
       if (Array.isArray(entry) && entry.length >= 2) {
         const pluginOptions = entry[1] as Record<string, unknown>
         if (pluginOptions.obsidian_note_logger) {
-          raw = pluginOptions.obsidian_note_logger as Partial<NoteLoggerConfig>
-          break
+          return pluginOptions.obsidian_note_logger as Partial<NoteLoggerConfig>
         }
       }
     }
   } catch {
-    // No config file or parse error — use all defaults
+    // No config file or parse error — return empty
+  }
+  return {}
+}
+
+function loadConfig(directory: string, worktree: string): NoteLoggerConfig {
+  // Read global config first (base layer), then project-level config (overrides).
+  // This mirrors OpenCode's own config merge behaviour: global → project.
+  // When the plugin is installed globally, `directory` = ~/.config/opencode/
+  // and `worktree` = the current project repo. The project opencode.json may
+  // only set `project` and `vault`, inheriting everything else from global.
+  const globalRaw = readPluginConfig(resolve(directory, "opencode.json"))
+  const projectRaw = worktree !== directory
+    ? readPluginConfig(resolve(worktree, "opencode.json"))
+    : {}
+  // Merge: project-level values override global, but only if explicitly set (not null/undefined)
+  const raw: Partial<NoteLoggerConfig> = { ...globalRaw }
+  for (const [k, v] of Object.entries(projectRaw)) {
+    if (v !== null && v !== undefined) {
+      (raw as Record<string, unknown>)[k] = v
+    }
   }
   return {
     model: raw.model ?? null,
@@ -102,7 +118,7 @@ function getOrCreate(sessions: Map<string, SessionData>, sid: string): SessionDa
 export const ObsidianNoteLoggerPlugin = async (
   { client, worktree, directory, $ }: PluginInput,
 ) => {
-  const config = loadConfig(directory)
+  const config = loadConfig(directory, worktree)
   const sessions = new Map<string, SessionData>()
   // Bug fix: prevent same session from re-firing after it's been processed.
   // Without this, message.updated events after sessions.delete() re-create the
