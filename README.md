@@ -78,7 +78,10 @@ cp .opencode/plugins/obsidian_note_logger.ts ~/.config/opencode/plugins/
 cp .opencode/tools/obsidian_note_writer.py   ~/.config/opencode/tools/
 cp .opencode/tools/Modelfiles/*.Modelfile    ~/.config/opencode/tools/Modelfiles/
 cp .opencode/agents/notedrift.md             ~/.config/opencode/agents/
-cp -r .opencode/skills/                      ~/.config/opencode/skills/
+cp -r .opencode/skills/init-new-moc          ~/.config/opencode/skills/
+cp -r .opencode/skills/notedrift             ~/.config/opencode/skills/
+cp -r obsidian-dev-notes                     ~/.config/opencode/skills/
+cp -r obsidian-cli                           ~/.config/opencode/skills/
 
 pip install openai>=1.0.0
 ```

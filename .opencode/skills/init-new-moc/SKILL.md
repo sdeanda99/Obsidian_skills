@@ -71,7 +71,10 @@ B) Global
   cp .opencode/tools/obsidian_note_writer.py ~/.config/opencode/tools/
   cp .opencode/tools/Modelfiles/*.Modelfile ~/.config/opencode/tools/Modelfiles/
   cp .opencode/agents/notedrift.md ~/.config/opencode/agents/
-  cp -r .opencode/skills/ ~/.config/opencode/skills/
+  cp -r .opencode/skills/init-new-moc ~/.config/opencode/skills/
+  cp -r .opencode/skills/notedrift ~/.config/opencode/skills/
+  cp -r obsidian-dev-notes ~/.config/opencode/skills/
+  cp -r obsidian-cli ~/.config/opencode/skills/
   ```
   Wait for user to confirm files are copied before continuing.
 - Target config file: `~/.config/opencode/opencode.json`
