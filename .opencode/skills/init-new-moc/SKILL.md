@@ -56,42 +56,49 @@ B) Global
 
 **If Project-level (A):**
 - Target config file: `<worktree>/opencode.json`
-- Plugin path in config: `.opencode/plugins/obsidian_note_logger.ts`
+- Detect the absolute path to the global plugin:
+  ```bash
+  # Resolve ~ to actual home directory
+  PLUGIN_PATH="$HOME/.config/opencode/plugins/obsidian_note_logger.ts"
+  ```
+  Use this absolute path (e.g. `/home/username/.config/opencode/plugins/obsidian_note_logger.ts`)
+  as the plugin path in the config — NOT a tilde path (tilde causes npm lookup errors in OpenCode).
 - Proceed directly to Stage 1
 
 **If Global (B):**
-- Check if plugin file exists at `~/.config/opencode/plugins/obsidian_note_logger.ts`
+- Detect absolute plugin path: `$HOME/.config/opencode/plugins/obsidian_note_logger.ts`
+- Check if plugin file exists at that path
 - If NOT found, show these copy commands and ask user to run them, then confirm:
   ```bash
   mkdir -p ~/.config/opencode/plugins \
             ~/.config/opencode/tools \
             ~/.config/opencode/tools/Modelfiles \
             ~/.config/opencode/agents
-  cp .opencode/plugins/obsidian_note_logger.ts ~/.config/opencode/plugins/
-  cp .opencode/tools/obsidian_note_writer.py ~/.config/opencode/tools/
-  cp .opencode/tools/Modelfiles/*.Modelfile ~/.config/opencode/tools/Modelfiles/
-  cp .opencode/agents/notedrift.md ~/.config/opencode/agents/
-  cp -r .opencode/skills/init-new-moc ~/.config/opencode/skills/
-  cp -r .opencode/skills/notedrift ~/.config/opencode/skills/
-  cp -r obsidian-dev-notes ~/.config/opencode/skills/
-  cp -r obsidian-cli ~/.config/opencode/skills/
+  cp /path/to/Obsidian_skills/.opencode/plugins/obsidian_note_logger.ts ~/.config/opencode/plugins/
+  cp /path/to/Obsidian_skills/.opencode/tools/obsidian_note_writer.py ~/.config/opencode/tools/
+  cp /path/to/Obsidian_skills/.opencode/tools/Modelfiles/*.Modelfile ~/.config/opencode/tools/Modelfiles/
+  cp /path/to/Obsidian_skills/.opencode/agents/notedrift.md ~/.config/opencode/agents/
+  cp -r /path/to/Obsidian_skills/.opencode/skills/init-new-moc ~/.config/opencode/skills/
+  cp -r /path/to/Obsidian_skills/.opencode/skills/notedrift ~/.config/opencode/skills/
+  cp -r /path/to/Obsidian_skills/obsidian-dev-notes ~/.config/opencode/skills/
+  cp -r /path/to/Obsidian_skills/obsidian-cli ~/.config/opencode/skills/
   ```
   Wait for user to confirm files are copied before continuing.
 - Target config file: `~/.config/opencode/opencode.json`
-- Plugin path in config: `~/.config/opencode/plugins/obsidian_note_logger.ts`
+- Use absolute plugin path (no tilde) in all config writes
 - Proceed to Stage 1
 
 **After Stage 7 (config write), if Global was chosen, show this message:**
 ```
 Global install complete!
 
-For each new project repo, run init-new-moc in that repo, OR create a minimal
-opencode.json in the project root with just the project-specific overrides:
+For each new project repo, run init-new-moc in that repo (choose Project-level),
+OR manually create a minimal opencode.json with just the project-specific overrides:
 
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [[
-    "~/.config/opencode/plugins/obsidian_note_logger.ts",
+    "/home/<your-username>/.config/opencode/plugins/obsidian_note_logger.ts",
     {
       "obsidian_note_logger": {
         "project": "your-project-slug",
@@ -101,7 +108,8 @@ opencode.json in the project root with just the project-specific overrides:
   ]]
 }
 
-Restart the OpenCode server to pick up the new global plugin config.
+IMPORTANT: Use the absolute path (no ~) for the plugin path.
+Restart the OpenCode server to pick up the new config.
 ```
 
 ---
@@ -306,20 +314,52 @@ The following will be saved to <target-config-file>:
 Save these settings? (yes / no / edit)
 ```
 
-On **yes**: write target config atomically
+On **yes**: write target config atomically.
 
-The full `obsidian_note_logger` config object written must include ALL of these fields
-(the TypeScript plugin's `NoteLoggerConfig` interface requires all of them):
+The write behavior differs by install level:
+
+### Project-level write
+
+Write a **minimal** `<worktree>/opencode.json` that only overrides project-specific
+fields. All other settings (model, thresholds, notifications) inherit from the global
+config via OpenCode's merge behaviour:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [[
+    "/home/<username>/.config/opencode/plugins/obsidian_note_logger.ts",
+    {
+      "obsidian_note_logger": {
+        "project": "<kebab-slug>",
+        "vault": "<vault>"
+      }
+    }
+  ]]
+}
+```
+
+CRITICAL: Use the **absolute path** for the plugin (expand `~` to the actual home
+directory). Tilde paths cause npm lookup errors in OpenCode. Detect with:
+```bash
+echo "$HOME/.config/opencode/plugins/obsidian_note_logger.ts"
+```
+
+### Global write
+
+Write the **full config** to `~/.config/opencode/opencode.json`. The global config
+must contain ALL fields of the `NoteLoggerConfig` TypeScript interface — omitting
+`project` or `ollama_model` causes them to be silently dropped:
 
 ```json
 {
   "obsidian_note_logger": {
-    "project":        "<kebab-slug or null>",
-    "model":          "<model or null>",
-    "base_url":       "<url or null>",
+    "project":        null,
+    "model":          "<model>",
+    "base_url":       "<url>",
     "api_key":        "<key or null>",
     "ollama_model":   "<model or null>",
-    "vault":          "<vault or null>",
+    "vault":          "<vault>",
     "note_skill":     "obsidian-dev-notes",
     "min_tool_calls": 10,
     "min_messages":   8,
@@ -331,16 +371,11 @@ The full `obsidian_note_logger` config object written must include ALL of these 
 }
 ```
 
-IMPORTANT: `project` and `ollama_model` MUST be included in the written config —
-they are fields on the `NoteLoggerConfig` TypeScript interface and will be silently
-dropped if omitted, causing "unknown project slug" errors.
+Note: `project` is `null` in global config — each project repo overrides it.
 
-- **Project-level:** read `<worktree>/opencode.json` → update `plugin[0][1].obsidian_note_logger`
-  with the full object above → write back with `json.dumps(indent=2)` + newline
-- **Global:** read `~/.config/opencode/opencode.json` → update/add `plugin` block with full
-  object above and `provider.ollama` block (if Ollama chosen) → write back with `json.dumps(indent=2)` + newline
-- If 5e Modelfile mismatch: also update `provider.ollama.models.notetaker.limit.context`
-  and `provider.ollama.models.note-drift.limit.context` to match Modelfile `num_ctx`
+Also add `provider.ollama` block if Ollama chosen. If 5e Modelfile mismatch detected,
+update `provider.ollama.models.notetaker.limit.context` and
+`provider.ollama.models.note-drift.limit.context` to match Modelfile `num_ctx`.
 
 On **no**: abort — tell user no files were modified.
 
