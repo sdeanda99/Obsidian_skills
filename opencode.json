@@ -5,22 +5,11 @@
   ],
   "plugin": [
     [
-      ".opencode/plugins/obsidian_note_logger.ts",
+      "/home/saba/.config/opencode/plugins/obsidian_note_logger.ts",
       {
         "obsidian_note_logger": {
-          "project": null,
-          "model": null,
-          "base_url": null,
-          "api_key": null,
-          "ollama_model": null,
-          "vault": null,
-          "note_skill": "obsidian-dev-notes",
-          "min_tool_calls": 10,
-          "min_messages": 8,
-          "log_path": "wiki/log.md",
-          "log_enabled": true,
-          "toast_enabled": true,
-          "os_notify": true
+          "project": "obsidian-note-logger",
+          "vault": "Diddys_Diaries"
         }
       }
     ]
