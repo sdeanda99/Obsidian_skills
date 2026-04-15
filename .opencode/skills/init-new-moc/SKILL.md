@@ -307,9 +307,40 @@ Save these settings? (yes / no / edit)
 ```
 
 On **yes**: write target config atomically
-- **Project-level:** read `<worktree>/opencode.json` → update `plugin[0][1].obsidian_note_logger` fields → write back with `json.dumps(indent=2)` + newline
-- **Global:** read `~/.config/opencode/opencode.json` → update/add `plugin` block and `provider.ollama` block (if Ollama chosen) → write back with `json.dumps(indent=2)` + newline
-- If 5e Modelfile mismatch: also update `provider.ollama.models.notetaker.limit.context` and `provider.ollama.models.note-drift.limit.context`
+
+The full `obsidian_note_logger` config object written must include ALL of these fields
+(the TypeScript plugin's `NoteLoggerConfig` interface requires all of them):
+
+```json
+{
+  "obsidian_note_logger": {
+    "project":        "<kebab-slug or null>",
+    "model":          "<model or null>",
+    "base_url":       "<url or null>",
+    "api_key":        "<key or null>",
+    "ollama_model":   "<model or null>",
+    "vault":          "<vault or null>",
+    "note_skill":     "obsidian-dev-notes",
+    "min_tool_calls": 10,
+    "min_messages":   8,
+    "log_path":       "wiki/log.md",
+    "log_enabled":    true,
+    "toast_enabled":  true,
+    "os_notify":      true
+  }
+}
+```
+
+IMPORTANT: `project` and `ollama_model` MUST be included in the written config —
+they are fields on the `NoteLoggerConfig` TypeScript interface and will be silently
+dropped if omitted, causing "unknown project slug" errors.
+
+- **Project-level:** read `<worktree>/opencode.json` → update `plugin[0][1].obsidian_note_logger`
+  with the full object above → write back with `json.dumps(indent=2)` + newline
+- **Global:** read `~/.config/opencode/opencode.json` → update/add `plugin` block with full
+  object above and `provider.ollama` block (if Ollama chosen) → write back with `json.dumps(indent=2)` + newline
+- If 5e Modelfile mismatch: also update `provider.ollama.models.notetaker.limit.context`
+  and `provider.ollama.models.note-drift.limit.context` to match Modelfile `num_ctx`
 
 On **no**: abort — tell user no files were modified.
 
