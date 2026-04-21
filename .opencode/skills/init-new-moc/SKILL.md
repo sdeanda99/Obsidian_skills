@@ -68,20 +68,26 @@ B) Global
 **If Global (B):**
 - Detect absolute plugin path: `$HOME/.config/opencode/plugins/obsidian_note_logger.ts`
 - Check if plugin file exists at that path
-- If NOT found, show these copy commands and ask user to run them, then confirm:
+- If NOT found, the user needs to clone the Obsidian_skills repo and run the install.
+  Show these commands and ask user to run them, then confirm:
   ```bash
+  # Clone the repo (skip if already cloned)
+  git clone https://github.com/sdeanda99/Obsidian_skills.git ~/Work/Obsidian_skills
+
+  REPO=~/Work/Obsidian_skills
   mkdir -p ~/.config/opencode/plugins \
             ~/.config/opencode/tools \
             ~/.config/opencode/tools/Modelfiles \
-            ~/.config/opencode/agents
-  cp /path/to/Obsidian_skills/.opencode/plugins/obsidian_note_logger.ts ~/.config/opencode/plugins/
-  cp /path/to/Obsidian_skills/.opencode/tools/obsidian_note_writer.py ~/.config/opencode/tools/
-  cp /path/to/Obsidian_skills/.opencode/tools/Modelfiles/*.Modelfile ~/.config/opencode/tools/Modelfiles/
-  cp /path/to/Obsidian_skills/.opencode/agents/notedrift.md ~/.config/opencode/agents/
-  cp -r /path/to/Obsidian_skills/.opencode/skills/init-new-moc ~/.config/opencode/skills/
-  cp -r /path/to/Obsidian_skills/.opencode/skills/notedrift ~/.config/opencode/skills/
-  cp -r /path/to/Obsidian_skills/obsidian-dev-notes ~/.config/opencode/skills/
-  cp -r /path/to/Obsidian_skills/obsidian-cli ~/.config/opencode/skills/
+            ~/.config/opencode/agents \
+            ~/.config/opencode/skills
+  cp $REPO/tools/obsidian_note_logger.ts  ~/.config/opencode/plugins/  2>/dev/null || \
+  cp $REPO/.opencode/plugins/obsidian_note_logger.ts ~/.config/opencode/plugins/
+  cp $REPO/tools/obsidian_note_writer.py  ~/.config/opencode/tools/    2>/dev/null || \
+  cp $REPO/.opencode/tools/obsidian_note_writer.py   ~/.config/opencode/tools/
+  cp $REPO/.opencode/tools/Modelfiles/*.Modelfile ~/.config/opencode/tools/Modelfiles/
+  cp $REPO/.opencode/agents/notedrift.md ~/.config/opencode/agents/
+  cp -r $REPO/.opencode/skills/init-new-moc ~/.config/opencode/skills/
+  cp -r $REPO/.opencode/skills/notedrift   ~/.config/opencode/skills/
   ```
   Wait for user to confirm files are copied before continuing.
 - Target config file: `~/.config/opencode/opencode.json`
@@ -366,12 +372,15 @@ must contain ALL fields of the `NoteLoggerConfig` TypeScript interface — omitt
     "log_path":       "wiki/log.md",
     "log_enabled":    true,
     "toast_enabled":  true,
-    "os_notify":      true
+    "os_notify":      true,
+    "rest_api_key":   null,
+    "rest_api_port":  27123
   }
 }
 ```
 
 Note: `project` is `null` in global config — each project repo overrides it.
+Note: `rest_api_key` is only needed if the Obsidian Local REST API plugin requires authentication. Leave `null` to skip REST and use filesystem writes.
 
 Also add `provider.ollama` block if Ollama chosen. If 5e Modelfile mismatch detected,
 update `provider.ollama.models.notetaker.limit.context` and
@@ -404,6 +413,8 @@ log_path         → path inside vault for the audit log file
 toast_enabled    → show TUI toast notifications when a note is written or on error
 os_notify        → show an OS desktop notification after a note is written
 note_skill       → which skill teaches the LLM note format (default: obsidian-dev-notes)
+rest_api_key     → Obsidian Local REST API key (null = skip REST, write via filesystem)
+rest_api_port    → Obsidian Local REST API port (default: 27123)
 ```
 
 ---
