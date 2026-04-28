@@ -247,6 +247,44 @@ Read `~/.local/share/opencode/auth.json` and check `openrouter.key` is present a
 Check that `.opencode/skills/obsidian-dev-notes/SKILL.md` (or global equivalent) exists.
 - ⚠ Missing → "note_skill 'obsidian-dev-notes' not found — note generation may use default style"
 
+### 5h: Python environment — openai importable
+
+Run:
+```bash
+python3 -c "import openai; print(openai.__version__)"
+```
+
+- ✅ Returns a version → `openai` is importable by the worker's `python3`; pass
+- ❌ `ModuleNotFoundError` → the active `python3` cannot see `openai` — **hard block**, fix
+  before continuing
+
+  **Determine what Python is active:**
+  ```bash
+  which python3
+  python3 -c "import sys; print(sys.executable)"
+  ```
+
+  **If a uv-managed project (pyproject.toml exists in worktree) — preferred fix:**
+  ```bash
+  uv add openai
+  ```
+  This adds `openai` to the project's venv so it is always available regardless of which
+  Python is on PATH.
+
+  **If pip / no uv:**
+  ```bash
+  pip install openai
+  ```
+
+  **If openai is globally installed but shadowed by a project venv without uv:**
+  > "Your project venv at `.venv/` excludes global site-packages. The quickest fix is
+  > `uv add openai` to add it to this project's venv. Alternatively, set `python_bin`
+  > in the config to point to the global Python interpreter that has `openai` installed
+  > (see Config Field Reference)."
+
+  After applying the fix, re-run `python3 -c "import openai; print(openai.__version__)"` to
+  confirm before continuing.
+
 ---
 
 ## Stage 6: MOC Creation
@@ -415,6 +453,12 @@ os_notify        → show an OS desktop notification after a note is written
 note_skill       → which skill teaches the LLM note format (default: obsidian-dev-notes)
 rest_api_key     → Obsidian Local REST API key (null = skip REST, write via filesystem)
 rest_api_port    → Obsidian Local REST API port (default: 27123)
+python_bin       → absolute path to the Python interpreter to use for the worker subprocess.
+                   Leave null to use bare `python3` (relies on PATH). Set this if the
+                   project venv shadows the global Python and you cannot add openai to the
+                   venv (e.g. a project you don't own). Example:
+                   /home/saba/.local/share/mise/installs/python/3.14.2/bin/python3
+                   Tip: find the right path with `mise which python3`
 ```
 
 ---
