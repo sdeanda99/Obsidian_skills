@@ -220,9 +220,37 @@ Report pass ✅ / warn ⚠ / fail ❌ for each:
 - ⚠ Fails → "Omnisearch unavailable — dedup search will be skipped, notes will still be written"
 
 ### 5c: Existing MOC check
-- Use `omnisearch_search({ query: "<project-name> MOC", limit: 5 })` — look for hits in `Projects/`
-- If found → "A MOC already exists at `Projects/<Name>-MOC.md`. Use existing or create new?"
-- If not found → proceed to create
+
+**Always list all existing MOCs first** — do NOT rely solely on Omnisearch slug matching.
+Slug casing mismatches cause false negatives (e.g. `openclawsetup` → `Openclawsetup` loses
+the internal capital S, causing every subsequent note to log `MOC not found`).
+
+1. Use `obsidian_listFiles` on the vault `Projects/` folder to get exact filenames.
+   Show the full list to the user:
+   ```
+   Existing MOCs in this vault:
+     - Projects/ObsidianNoteLogger-MOC.md
+     - Projects/OpenclawSetup-MOC.md
+   ```
+
+2. Ask the user explicitly:
+   ```
+   Does one of these MOCs belong to this project ("<project-name>")?
+   Enter the exact filename (e.g. OpenclawSetup-MOC.md), or type "none" to create a new one.
+   ```
+
+3. **If user confirms an existing MOC:**
+   - Store the exact confirmed filename (e.g. `OpenclawSetup-MOC.md`) — this is `moc_filename`
+   - Skip MOC creation in Stage 6
+   - Add `"moc_filename": "<confirmed-filename>"` to the plugin options in the Stage 7 config
+     write so the worker uses it directly instead of deriving it from the slug
+
+4. **If user says "none":**
+   - Proceed to Stage 6 to create a new MOC normally
+
+**Why this matters:** The pipeline's slug→PascalCase conversion loses internal capitalization.
+Obsidian IPC is case-sensitive. Explicit user confirmation is a hard guarantee that bypasses
+all slug conversion and prevents orphaned notes.
 
 ### 5d: Ollama checks (only if Ollama chosen in Stage 2)
 ```bash
@@ -459,6 +487,11 @@ python_bin       → absolute path to the Python interpreter to use for the work
                    venv (e.g. a project you don't own). Example:
                    /home/saba/.local/share/mise/installs/python/3.14.2/bin/python3
                    Tip: find the right path with `mise which python3`
+moc_filename     → exact filename of the project MOC (e.g. OpenclawSetup-MOC.md).
+                   Set this when the MOC filename has non-standard casing that the
+                   slug→PascalCase conversion gets wrong. When set, the worker uses
+                   this filename directly and skips all slug conversion.
+                   Example: "OpenclawSetup-MOC.md" (not "Openclawsetup-MOC.md")
 ```
 
 ---
@@ -472,3 +505,5 @@ python_bin       → absolute path to the Python interpreter to use for the work
 - MOC is created before config is written — if config write fails, MOC still exists
 - After saving config, always remind: **"Restart the OpenCode server to pick up the new plugin config"**
 - Run `@notedrift` after setup to link the new MOC into the vault graph
+- If orphaned notes were written before the MOC was found, run `@note-attach` to
+  bulk-attach them to the correct MOC
